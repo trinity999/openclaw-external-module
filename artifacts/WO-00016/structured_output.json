@@ -1,0 +1,190 @@
+{
+  "work_order": "WO-00016",
+  "category": "correlation",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "confidence": 0.90,
+
+  "key_findings": [
+    "ACS (Asset Confidence Score) is backward-looking (confirmed presence) — orthogonal to KRIL (forward-looking, strategic value); high ACS + high KRIL = prime enrichment target; high KRIL + low ACS = likely wildcard/CDN, skip enrichment",
+    "Three-dimension model: DNS stability (0.35 weight), HTTP evidence (0.40 weight), service exposure (0.25 weight) — HTTP evidence weighted highest as strongest confirmed presence signal",
+    "Wildcard suppression via wildcard_flag=0 in DNS stability — ensures wildcard-detected subdomains score <25 regardless of HTTP response (CDN catch-all pages produce valid HTTP responses on wildcard entries)",
+    "Resolution consistency signal (same A records across last 3 scans) discriminates real assets from dynamic wildcard DNS — wildcard returns different IPs per query; real servers return consistent IPs",
+    "Partial ACS computed after DNS batch with http_evidence=0 and service_exposure=0; recomputed as HTTP and enrich data arrive; acs_computed_at timestamp distinguishes partial from full score",
+    "Enrichment gate: enrich_eligible = (kril_score >= 50) AND (acs_score >= 40) — requires both strategic value and confirmed presence before expensive nuclei/katana enrichment",
+    "All 14 signal component values stored as acs_signals{} on Subdomain node — analyst can inspect ACS reasoning without re-running scorer",
+    "Top-decile validation: after first full cycle, ACS top-10% should produce >=20% more findings/subdomain vs naive uniform distribution; validates score discrimination power"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "ACS as separate score from KRIL (not merged)",
+      "summary": "ACS measures confirmed presence (backward-looking); KRIL measures scanning value (forward-looking); both required for enrichment gate",
+      "rationale": "Merging ACS into KRIL would create a single score that tries to answer two different questions: 'is this asset real?' and 'is this asset worth scanning?'. A wildcard entry for a high-value domain would get KRIL boosted by false DNS resolution signals. Separate scores are independently queryable and independently configurable.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "HTTP evidence weighted highest (0.40) over DNS stability (0.35) and service exposure (0.25)",
+      "summary": "HTTP response is the strongest single evidence of a live, reachable asset; DNS resolution is necessary but insufficient; service exposure is valuable but often unavailable early",
+      "rationale": "A subdomain that returns HTTP 200 with real content is almost certainly a live asset regardless of DNS instability or service scan gaps. DNS resolution is necessary but CDN edge nodes and wildcard domains also resolve. Service scan data is often unavailable until enrich phase.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "Wildcard suppression via wildcard_flag=0 in DNS stability",
+      "summary": "If wildcard_detected=true on subdomain, wildcard_flag signal is 0.0; DNS stability dimension capped below ACS threshold regardless of HTTP response",
+      "rationale": "CDN catch-all pages return valid HTTP 200 responses for wildcard DNS entries. Without wildcard suppression, every wildcard subdomain in a high-value domain would score high ACS due to HTTP evidence. Wildcard_flag=0 reduces ACS to <25 range for detected wildcards.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "Partial ACS computed immediately after DNS batch",
+      "summary": "ACS computed with available signals at each pipeline stage; http_evidence=0 and service_exposure=0 until data arrives; recomputed as evidence accumulates",
+      "rationale": "Waiting for full pipeline to complete before computing any ACS would delay enrichment gate decisions by the full pipeline cycle time. Partial ACS from DNS data alone allows early deprioritization of wildcard/CDN patterns before HTTP scan budget is spent.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Dual-gate enrichment threshold (KRIL >= 50 AND ACS >= 40)",
+      "summary": "Both strategic value and confirmed presence required before nuclei/katana enrichment; thresholds hot-reloadable in score_config.json",
+      "rationale": "KRIL-only gate sends enrichment to wildcard entries for high-value domains (expensive, noisy). ACS-only gate sends enrichment to low-value confirmed assets (uninformative). Dual gate targets the intersection: assets worth scanning AND confirmed to exist.",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "scoring_model": {
+    "name": "Asset Confidence Score (ACS)",
+    "range": "0-100",
+    "orientation": "backward-looking (confirmed presence evidence)",
+    "dimensions": [
+      {
+        "id": "dns_stability",
+        "weight": 0.35,
+        "signals": [
+          {"name": "resolution_confirmed", "sub_weight": 0.30, "formula": "1.0 if any A record present else 0.0"},
+          {"name": "resolution_consistency", "sub_weight": 0.30, "formula": "1.0 if same A records in last 3 scans, 0.5 if partial, 0.0 if all different"},
+          {"name": "wildcard_flag", "sub_weight": 0.20, "formula": "0.0 if wildcard_detected=true else 1.0"},
+          {"name": "cname_depth_penalty", "sub_weight": 0.10, "formula": "max(0.0, 1.0 - (cname_chain_length - 1) * 0.2)"},
+          {"name": "multi_a_record_bonus", "sub_weight": 0.10, "formula": "min(1.0, unique_a_record_count / 3)"}
+        ]
+      },
+      {
+        "id": "http_evidence",
+        "weight": 0.40,
+        "signals": [
+          {"name": "http_responded", "sub_weight": 0.35, "formula": "1.0 if HTTP response received else 0.0"},
+          {"name": "status_code_quality", "sub_weight": 0.25, "formula": "1.0 if status in {200,301,302,401,403,404}, 0.5 if 5xx, 0.0 if no response"},
+          {"name": "content_length_signal", "sub_weight": 0.15, "formula": "min(1.0, content_length / 500)"},
+          {"name": "title_present", "sub_weight": 0.10, "formula": "1.0 if page title present and non-empty else 0.0"},
+          {"name": "dynamic_content_signal", "sub_weight": 0.10, "formula": "1.0 if dynamic_content=true else 0.0"},
+          {"name": "technology_detected", "sub_weight": 0.05, "formula": "min(1.0, technology_count / 3)"}
+        ]
+      },
+      {
+        "id": "service_exposure",
+        "weight": 0.25,
+        "signals": [
+          {"name": "open_port_count_signal", "sub_weight": 0.40, "formula": "min(1.0, open_port_count / 5)"},
+          {"name": "known_service_detected", "sub_weight": 0.30, "formula": "1.0 if any port maps to named service else 0.0"},
+          {"name": "port_diversity", "sub_weight": 0.20, "formula": "min(1.0, unique_port_count / 3)"},
+          {"name": "non_http_service_bonus", "sub_weight": 0.10, "formula": "0.5 if non-HTTP service detected else 0.0"}
+        ]
+      }
+    ],
+    "final_formula": "round((dns_stability * 0.35 + http_evidence * 0.40 + service_exposure * 0.25) * 100, 1)",
+    "explainability_fields": ["acs_score", "acs_signals{}", "acs_computed_at", "acs_config_version"],
+    "write_back_target": "Subdomain node properties"
+  },
+
+  "score_bands": [
+    {"min": 80, "max": 100, "label": "high_confidence", "action": "full enrichment; high finding weight"},
+    {"min": 60, "max": 79, "label": "moderate_confidence", "action": "enrichment above KRIL threshold; normal finding weight"},
+    {"min": 40, "max": 59, "label": "weak_evidence", "action": "enrichment only if KRIL also high; reduced finding weight"},
+    {"min": 20, "max": 39, "label": "low_confidence", "action": "skip enrichment; low finding weight; reduced rescan priority"},
+    {"min": 0, "max": 19, "label": "very_low", "action": "no enrichment; findings treated as likely false positive"}
+  ],
+
+  "computation_triggers": [
+    {"trigger": "DNS batch completes", "signals_available": ["dns_stability"], "http_evidence_value": 0, "service_exposure_value": 0, "note": "partial ACS; gates early wildcard suppression"},
+    {"trigger": "HTTP batch completes", "signals_available": ["dns_stability", "http_evidence"], "service_exposure_value": 0, "note": "primary ACS; gates enrichment eligibility"},
+    {"trigger": "Enrich batch completes", "signals_available": ["dns_stability", "http_evidence", "service_exposure"], "note": "full ACS; final score for reporting"},
+    {"trigger": "Daily rescan", "signals_available": ["all"], "note": "recompute for assets older than 24h"}
+  ],
+
+  "enrichment_gate": {
+    "formula": "kril_score >= kril_threshold AND acs_score >= acs_enrich_threshold",
+    "default_kril_threshold": 50,
+    "default_acs_enrich_threshold": 40,
+    "hot_reloadable": true,
+    "config_file": "score_config.json"
+  },
+
+  "calibration_validation": {
+    "method": "Labeled sample of 1000 subdomains across 5 ACS bands; compare predicted confidence vs actual confirmed_live rate per band",
+    "target_calibration_error": 0.10,
+    "sample_size": 1000,
+    "bands": 5,
+    "band_size": 200
+  },
+
+  "top_decile_validation": {
+    "method": "Sort by ACS DESC; compare findings/subdomain in top 10% vs bottom 90%",
+    "target_precision_uplift_pct": 20,
+    "validation_frequency": "After first full DNS+HTTP+Enrich cycle"
+  },
+
+  "edge_case_handling": [
+    {"case": "Unresolved subdomain", "dns_stability_effect": "resolution_confirmed=0", "expected_acs_range": "0-15"},
+    {"case": "Wildcard-detected", "dns_stability_effect": "wildcard_flag=0", "expected_acs_range": "5-25"},
+    {"case": "CDN edge only", "service_effect": "non_http_service_bonus=0", "expected_acs_range": "40-65 (HTTP dominant)"},
+    {"case": "Service scan not yet run", "service_exposure_value": 0, "note": "recomputed after enrich"},
+    {"case": "Changing IPs (CDN)", "dns_stability_effect": "resolution_consistency=0.5", "note": "multi_a_record_bonus may partially compensate"},
+    {"case": "CNAME-only, no A record", "dns_stability_effect": "resolution_confirmed=0 if no final A record", "expected_acs_range": "0-10"}
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "CDN edge nodes score high ACS due to HTTP response", "severity": "MEDIUM", "probability": "HIGH", "mitigation": "non_http_service_bonus and resolution_consistency penalize CDN patterns; CDN detection from httpx headers can zero http_evidence"},
+    {"id": "R2", "title": "Calibration drift over time", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Monthly calibration re-check against sampled labeled set; alert if calibration error exceeds 10%"},
+    {"id": "R3", "title": "Enrichment gate excludes interesting low-ACS assets", "severity": "MEDIUM", "probability": "LOW", "mitigation": "acs_enrich_threshold hot-reloadable; analyst override via direct enrichment request"},
+    {"id": "R4", "title": "Service scan data availability lag", "severity": "LOW", "probability": "HIGH", "mitigation": "Partial ACS computed without service dimension; final ACS after enrich; both stored with acs_computed_at"},
+    {"id": "R5", "title": "Top-decile precision uplift <20% in early cycles", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Validate after first full cycle; adjust dimension weights in score_config.json"},
+    {"id": "R6", "title": "ACS score discontinuities on weight changes", "severity": "LOW", "probability": "MEDIUM", "mitigation": "acs_config_version stored with each score for audit provenance"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Add wildcard_detected flag check as first condition in DNS stability — prevents wildcard entries from scoring above ACS enrich threshold"},
+    {"priority": 2, "id": "REC-02", "action": "Compute partial ACS after each DNS batch and store with acs_computed_at — enables early enrichment gate decisions before HTTP phase"},
+    {"priority": 3, "id": "REC-03", "action": "Store all 14 signal component values as acs_signals{} on Subdomain node — analyst explainability requires this from day 1"},
+    {"priority": 4, "id": "REC-04", "action": "Implement dual-gate enrichment: kril_score >= 50 AND acs_score >= 40 — reduces enrichment noise from high-KRIL wildcard entries"},
+    {"priority": 5, "id": "REC-05", "action": "Add acs_enrich_threshold to score_config.json alongside kril_threshold — enables threshold tuning without code change"},
+    {"priority": 6, "id": "REC-06", "action": "Run calibration validation after first full cycle: 1000 labeled subdomains across 5 ACS bands — validates score calibration before relying on it for reporting"},
+    {"priority": 7, "id": "REC-07", "action": "Add ORS signal acs_age > 24h for active assets — triggers rescan for stale ACS scores"},
+    {"priority": 8, "id": "REC-08", "action": "Monitor top-decile precision uplift after first full cycle; adjust dimension weights if uplift < 20%"}
+  ],
+
+  "metrics": {
+    "score_dimensions": 3,
+    "total_signals": 15,
+    "dns_signals": 5,
+    "http_signals": 6,
+    "service_signals": 4,
+    "calibration_error_target_pct": 10,
+    "top_decile_precision_uplift_target_pct": 20,
+    "compute_overhead_target_pct": 8,
+    "neo4j_writeback_latency_max_sec": 30,
+    "score_freshness_target_hours": 24,
+    "enrichment_gate_kril_threshold_default": 50,
+    "enrichment_gate_acs_threshold_default": 40
+  },
+
+  "assumptions": [
+    "A1: DNS consistency signal requires at least 3 scan observations; partial score if fewer available",
+    "A2: wildcard_detected flag stored on Subdomain node from DNS validation phase",
+    "A3: Service scan produces open_port_count and service identifications stored on Port nodes",
+    "A4: HTTP evidence signals produced by httpx parser and stored on Subdomain node",
+    "A5: ACS computation async-pipelined at same architectural layer as KRIL scoring",
+    "A6: score_config.json hot-reload supports ACS weight fields"
+  ]
+}
