@@ -1,0 +1,292 @@
+{
+  "work_order": "WO-00006",
+  "category": "architecture",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.89,
+
+  "key_findings": [
+    "DNS + HTTP co-run is safe at full concurrency (250+75) consuming ~55% Oracle CPU; adding Enrich at 25 concurrent exceeds 32-core Oracle — DNS must reduce to 200 during Enrich steady state",
+    "Phase 1 (H0-H4) DNS-only validation is mandatory — activating HTTP before integrity gate is confirmed risks HTTP-DNS link corruption that propagates through the full graph",
+    "Controller RAM is the critical constraint at 16GB: Neo4j heap+cache requires 14-24GB; ClickHouse must move to Oracle if controller RAM is 16GB",
+    "ORS CPU governor (auto-reduce DNS by 25 at oracle_cpu > 80%) is required for Phase 3 steady state — manual CPU management is too slow for sustained 72h operation",
+    "DNS corpus completes well before H48 at sustained 200-250 concurrent (~14h for 10M corpus); HTTP is the long-tail lane requiring Phase 4 step-up to 100-150 concurrent to complete within 72h",
+    "Phase gate automation in AWSEM (next lane does not activate until ORS confirms gate) prevents manual timing errors during 72h unattended operation",
+    "Four-phase schedule provides 30-50% throughput increase over single-lane baseline while respecting Oracle CPU envelope and controller ingest capacity",
+    "Enrich lane ramps from 10 to 25 over 4h at activation — avoids CPU spike that would trigger ORS governor and reduce DNS prematurely"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Phase 1: 4h DNS-only validation window",
+      "summary": "No HTTP activation until Phase 1 gate passes: error_rate <= 2%, mismatch <= 0.5%, ORS green 30 min",
+      "rationale": "Multi-lane activation before integrity validation risks HTTP-DNS link errors that corrupt graph topology; 4h gate window is cheap insurance against hours of bad data",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D2",
+      "title": "DNS reduced to 200 concurrent in Phase 3 steady state",
+      "summary": "DNS 250 + HTTP 75 + Enrich 25 exceeds 32-core Oracle; DNS compressed to 200 to stay within CPU envelope",
+      "rationale": "11% DNS throughput reduction is preferable to oracle CPU saturation causing thermal throttling and scan tool failures across all lanes",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "ORS CPU governor auto-reduces DNS concurrency",
+      "summary": "oracle_cpu > 80% → reduce DNS by 25; oracle_cpu < 70% for 30 min → restore DNS by 25",
+      "rationale": "72h operation requires autonomous CPU management; manual adjustment is too slow and error-prone under sustained high-load conditions",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D4",
+      "title": "ClickHouse relocates to Oracle if controller RAM <= 16GB",
+      "summary": "Neo4j requires 14GB+ RAM on controller; ClickHouse moved to Oracle (30GB+ RAM available) via connection string update only",
+      "rationale": "Sharing 16GB between Neo4j, ClickHouse, and Redis creates swap risk during ingest spikes; Oracle has sufficient RAM headroom at peak workload",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "HTTP step-up in Phase 4: 75 → 100 → 150",
+      "summary": "As DNS corpus completes and Enrich winds down, Oracle CPU freed; HTTP steps up to clear HTTP corpus within 72h",
+      "rationale": "HTTP is the long-tail lane; 75 concurrent cannot complete 2.5-4M HTTP targets in remaining Phase 4 time; step-up is necessary to meet 80% HTTP completion target",
+      "stability_impact": "neutral"
+    },
+    {
+      "id": "D6",
+      "title": "Enrich activates at 10 concurrent, ramps to 25 over 4h",
+      "summary": "Gradual Enrich ramp prevents Oracle CPU spike at activation; ORS confirms CPU envelope before each increment",
+      "rationale": "Nuclei/katana are CPU-heavy; sudden activation at 25 concurrent would spike CPU by ~16 cores simultaneously, triggering ORS governor and unnecessarily reducing DNS",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "phase_schedule": [
+    {
+      "phase": 1,
+      "name": "Validation Pass",
+      "hours": "H0-H4",
+      "lanes": {
+        "dns_concurrent": 250,
+        "http_concurrent": 0,
+        "enrich_concurrent": 0,
+        "ingest_neo4j_tx": 15,
+        "validate_workers": 3
+      },
+      "oracle_cpu_pct": "25",
+      "controller_cpu_pct": "30",
+      "gate_conditions": {
+        "dns_error_rate_max": 0.02,
+        "validate_mismatch_max_pct": 0.005,
+        "ors_green_min_minutes": 30,
+        "neo4j_nodes_min": 10000
+      },
+      "exit_to": "Phase 2"
+    },
+    {
+      "phase": 2,
+      "name": "HTTP Ramp",
+      "hours": "H4-H12",
+      "lanes": {
+        "dns_concurrent": 250,
+        "http_concurrent": 75,
+        "enrich_concurrent": 0,
+        "ingest_neo4j_tx": 15,
+        "validate_workers": 3
+      },
+      "oracle_cpu_pct": "55-60",
+      "controller_cpu_pct": "50-65",
+      "gate_conditions": {
+        "http_error_rate_first_2k_max": 0.10,
+        "dns_http_link_rate_min": 0.95,
+        "http_positives_for_enrich_min": 10000
+      },
+      "sub_phase_2b": {
+        "trigger": "http_positives >= 10000",
+        "dns_concurrent": 150,
+        "enrich_concurrent": 10,
+        "oracle_cpu_pct": "65"
+      },
+      "exit_to": "Phase 3"
+    },
+    {
+      "phase": 3,
+      "name": "Steady State",
+      "hours": "H12-H48",
+      "sub_phases": [
+        {
+          "name": "Enrich Warm-Up",
+          "hours": "H12-H24",
+          "dns_concurrent": 150,
+          "http_concurrent": 75,
+          "enrich_concurrent": "10→25",
+          "oracle_cpu_pct": "65-80"
+        },
+        {
+          "name": "Full Steady State",
+          "hours": "H24-H48",
+          "dns_concurrent": "200 (governed)",
+          "http_concurrent": 75,
+          "enrich_concurrent": 25,
+          "oracle_cpu_pct": "80-85 (ORS governed)"
+        }
+      ],
+      "ingest_neo4j_tx": 15,
+      "validate_workers": 3,
+      "controller_cpu_pct": "65-75",
+      "ors_governor": {
+        "signal": "oracle_cpu_utilization_pct",
+        "reduce_trigger": 80,
+        "reduce_action": "dns_concurrent -= 25",
+        "restore_trigger": 70,
+        "restore_condition": "stable_for_30_min",
+        "restore_action": "dns_concurrent += 25"
+      },
+      "exit_to": "Phase 4"
+    },
+    {
+      "phase": 4,
+      "name": "Scale-Up and Tail",
+      "hours": "H48-H72",
+      "lanes": {
+        "dns_concurrent": "350 (if remaining) or 0 (if complete)",
+        "http_concurrent": "100→150 (step-up)",
+        "enrich_concurrent": "25→10→0 (winding down)",
+        "ingest_neo4j_tx": 15,
+        "validate_workers": 3
+      },
+      "http_step_up_gate": "http_error_rate < 0.05 at current concurrency",
+      "oracle_cpu_pct": "70-90",
+      "controller_cpu_pct": "55",
+      "objectives": ["Complete HTTP corpus >= 80%", "Complete enrichment queue", "Graph next-hop queries if T5 deployed"]
+    }
+  ],
+
+  "node_allocation_matrix": {
+    "oracle": {
+      "cores_total": 32,
+      "ram_gb_total": 64,
+      "lane_resource_profiles": {
+        "dns_250_concurrent": {"cores": "4-8", "ram_gb": "2-4"},
+        "http_75_concurrent": {"cores": "8-12", "ram_gb": "4-8"},
+        "enrich_25_concurrent": {"cores": "16-20", "ram_gb": "8-16"}
+      },
+      "peak_co_run_draw": {"cores": "28-40", "ram_gb": "14-28"},
+      "safe_utilization_ceiling_pct": 85
+    },
+    "controller": {
+      "ram_gb_total": 16,
+      "recommended_ram_gb": 32,
+      "allocation": {
+        "neo4j_heap_gb": 6,
+        "neo4j_page_cache_gb": 8,
+        "clickhouse_buffer_gb": "0 (move to Oracle if RAM <= 16GB)",
+        "redis_gb": 0.5,
+        "os_overhead_gb": 2
+      },
+      "neo4j_requires_ssd": true,
+      "clickhouse_relocation_trigger": "controller_ram_lte_16gb"
+    }
+  },
+
+  "rollback_gates": {
+    "phase_1_to_2": {
+      "dns_error_rate_max": 0.02,
+      "validate_mismatch_max_pct": 0.005,
+      "ors_green_min_minutes": 30
+    },
+    "phase_2_to_2b": {
+      "http_error_rate_first_2k_max": 0.10,
+      "dns_http_link_rate_min": 0.95
+    },
+    "phase_3_dns_stepup": {
+      "oracle_cpu_max_pct": 80,
+      "all_ors_green_min_minutes": 120
+    },
+    "phase_4_http_stepup": {
+      "http_error_rate_at_current_max": 0.05
+    },
+    "global_halt_triggers": [
+      "source_file_hash_mismatch",
+      "validate_mismatch_gt_2pct_two_consecutive_batches",
+      "oracle_unreachable_gt_120s",
+      "controller_disk_io_saturated"
+    ]
+  },
+
+  "ors_additions": [
+    {"signal": "oracle_cpu_utilization_pct", "warning": 80, "critical": 90, "reflex_warning": "dns_concurrent -= 25", "reflex_critical": "pause_dns_AND_alert"},
+    {"signal": "controller_neo4j_latency_p95_ms", "warning": 400, "critical": 500, "reflex_warning": "neo4j_tx = 10", "reflex_critical": "pause_ingest_alert"},
+    {"signal": "dns_http_link_rate_pct", "warning": 95, "critical": 90, "reflex_warning": "alert", "reflex_critical": "halt_http_lane"},
+    {"signal": "phase_gate_failed", "critical": "any", "reflex_critical": "suppress_next_phase_activation_alert"},
+    {"signal": "controller_disk_write_queue_mb", "warning": 500, "critical": 1000, "reflex_warning": "reduce_batch_size", "reflex_critical": "halt_ingest"}
+  ],
+
+  "productivity_kpis": {
+    "dns_department": {
+      "resolutions_per_hour_target": 700000,
+      "positive_rate_target": 0.20,
+      "error_rate_max": 0.02
+    },
+    "http_department": {
+      "probes_per_hour_target": 50000,
+      "positive_rate_target": 0.30,
+      "link_rate_min": 0.95
+    },
+    "enrichment_department": {
+      "targets_per_hour_target": 5000,
+      "findings_per_hour_target": 50
+    },
+    "ingest_department": {
+      "records_per_hour_target": 200000,
+      "neo4j_write_latency_p95_ms_max": 500,
+      "validate_mismatch_rate_max": 0.005
+    },
+    "operations": {
+      "incident_mttr_min_max": 20,
+      "premium_escalation_rate_max": 0.05,
+      "dlq_per_lane_per_24h_max": 500
+    }
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "Oracle CPU exceeds 85% in Phase 3", "severity": "high", "probability": "high", "mitigation": "ORS CPU governor auto-reduces DNS; DNS is most compressible lane at Phase 3"},
+    {"id": "R2", "title": "Controller RAM insufficient for Neo4j + ClickHouse", "severity": "high", "probability": "medium", "mitigation": "Move ClickHouse to Oracle; reduce Neo4j page cache to 8GB with SSD backing"},
+    {"id": "R3", "title": "HTTP corpus not completable within 72h", "severity": "medium", "probability": "medium", "mitigation": "HTTP step-up to 150 concurrent in Phase 4; HTTP completion target 80% (not 100%)"},
+    {"id": "R4", "title": "Phase gate failure delays multi-lane activation", "severity": "medium", "probability": "low", "mitigation": "Gates are measurable; Phase 1 window builds high confidence before commit to Phase 2"},
+    {"id": "R5", "title": "DLQ accumulation under network instability", "severity": "medium", "probability": "medium", "mitigation": "Per-lane DLQ monitors; ORS alert at 500 items; DLQ TTL enforced"},
+    {"id": "R6", "title": "Neo4j degrades at 10M+ node scale", "severity": "high", "probability": "low", "mitigation": "Heap+page cache pre-configured; MERGE batch ≤ 500 ops; no full-graph scans during ingest"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Add oracle_cpu_utilization ORS monitor with DNS governor reflex before Phase 1"},
+    {"priority": 2, "id": "REC-02", "action": "Assess controller RAM; if <= 16GB, relocate ClickHouse to Oracle before 72h start"},
+    {"priority": 3, "id": "REC-03", "action": "Implement phase gate automation in AWSEM — next lane does not activate until ORS confirms gate"},
+    {"priority": 4, "id": "REC-04", "action": "Export phase transition events and per-lane KPIs to Mattermost OPS on each phase change"},
+    {"priority": 5, "id": "REC-05", "action": "Pre-configure Neo4j heap 6GB, page cache 8GB before Phase 1; verify startup < 5 min"},
+    {"priority": 6, "id": "REC-06", "action": "Define per-lane concurrency config flags for runtime adjustment without restart"},
+    {"priority": 7, "id": "REC-07", "action": "Record time_to_phase_n for each transition; compare against schedule for calibration"},
+    {"priority": 8, "id": "REC-08", "action": "Set HTTP completion target to 80% of corpus by H72; schedule remainder in follow-on run"}
+  ],
+
+  "metrics": {
+    "throughput_increase_vs_single_lane_min_pct": 30,
+    "oracle_cpu_target_range_pct": "65-85",
+    "controller_cpu_target_range_pct": "50-75",
+    "validate_mismatch_max_pct": 0.005,
+    "incident_mttr_max_min": 20,
+    "dns_corpus_completion_target_pct": 100,
+    "http_corpus_completion_target_pct": 80,
+    "dlq_per_lane_per_24h_max": 500
+  },
+
+  "assumptions": [
+    "A1: Oracle >= 32 CPU cores, >= 64GB RAM; CPU metrics available to ORS",
+    "A2: Controller >= 16GB RAM; 32GB recommended; SSD for Neo4j",
+    "A3: AWSEM supports concurrency adjustment on running lanes without restart",
+    "A4: ORS reads oracle_cpu_utilization as real-time signal",
+    "A5: Phase gate signals evaluated by ORS automatically; manual override available",
+    "A6: ClickHouse can relocate to Oracle via connection string update only",
+    "A7: DNS corpus (~10M) completable in ~14h at 700k/hr sustained; Phase 4 buffer handles retries and rate-limit pauses"
+  ]
+}
