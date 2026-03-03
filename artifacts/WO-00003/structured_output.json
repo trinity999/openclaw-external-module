@@ -1,0 +1,225 @@
+{
+  "work_order": "WO-00003",
+  "category": "audit",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.92,
+
+  "key_findings": [
+    "Dual-store write (Neo4j + ClickHouse) has a structural integrity gap at the inter-store boundary: a partial write (Neo4j success, ClickHouse fail) produces cross-store drift detectable only via explicit per-batch reconciliation — this is not guarded today",
+    "Neo4j MERGE semantics are idempotent for node creation but NOT if any ON MATCH SET clause uses += or list-append patterns — code audit required before concurrency ramp",
+    "ClickHouse INSERT is not transactional; duplicate rows exist between INSERT and background merge; all reconciliation queries must use FINAL keyword or results are incorrect",
+    "HTTP result dedup key using full body hash is vulnerable to dynamic content (timestamps, session IDs in HTML) — will produce duplicate HttpResult nodes under real-world scan conditions",
+    "Relationship MERGE will implicitly create minimal nodes if either endpoint is missing — endpoint pre-confirmation guard is required before every relationship MERGE",
+    "Per-batch reconciliation (not end-of-run) is mandatory — end-of-run detection allows millions of corrupt records to be ingested before discovery",
+    "All fqdn inputs must be normalized at Controller boundary (lowercase, strip trailing dot, punycode IDN conversion) before any dedup key computation",
+    "Idempotency replay test (Suite 6) must pass with zero new duplicates before first concurrency ramp — this is the pre-ramp gate"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Neo4j-first write order as authority contract",
+      "summary": "Neo4j write must complete before ClickHouse write; ClickHouse write is skipped on Neo4j failure",
+      "rationale": "Neo4j is the graph authority; ClickHouse is telemetry. Graph-without-telemetry is recoverable; telemetry-without-graph corrupts downstream graph queries",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D2",
+      "title": "ON MATCH SET must use = not +=",
+      "summary": "All Neo4j property updates on MATCH must use assignment operator; list-append patterns break idempotency under replay",
+      "rationale": "Accumulated values on replay produce incorrect data without any error signal; silent corruption risk",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D3",
+      "title": "Structural body fingerprint for HTTP dedup key",
+      "summary": "HTTP result dedup key uses structural fingerprint of first 512 bytes (stripped of session patterns) instead of full body sha256",
+      "rationale": "Full body hash produces different keys for same page on each scan due to dynamic content; structural fingerprint is stable across scans of the same logical page",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "Endpoint pre-confirmation before relationship MERGE",
+      "summary": "Controller must verify source and target nodes exist in Neo4j before issuing any relationship MERGE",
+      "rationale": "Neo4j MERGE creates implicit nodes if endpoints are missing; implicit nodes lack required properties and corrupt graph topology",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D5",
+      "title": "Per-batch reconciliation with 30s ClickHouse settle delay",
+      "summary": "Validate lane fires after every ingest batch; 30s settle before ClickHouse FINAL query to allow ReplacingMergeTree merge",
+      "rationale": "End-of-run detection allows massive corruption accumulation; per-batch detection bounds blast radius to one batch (≤5,000 items)",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D6",
+      "title": "Quarantine on filesystem, not database",
+      "summary": "Failed integrity items written to artifacts/quarantine/ filesystem path with full forensic context",
+      "rationale": "DB-based quarantine fails when DB is unavailable; filesystem quarantine works during datastore failure — exactly when quarantine is most needed",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D7",
+      "title": "TTL bucketing for DNS record dedup key",
+      "summary": "DNS record dedup key uses floor(ttl/300)*300 TTL bucket, not exact TTL value",
+      "rationale": "Exact TTL produces different dedup keys as TTL decrements across scans; 5-minute bucketing collapses the key space to stable windows",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D8",
+      "title": "ingested_batch_id added to both stores",
+      "summary": "Neo4j node properties and ClickHouse rows both carry ingested_batch_id field for per-batch reconciliation",
+      "rationale": "Without batch ID field, cross-store reconciliation requires full-table scans; batch ID enables targeted O(batch_size) reconciliation",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "dedup_key_contracts": {
+    "subdomain_node": "lowercase(strip_trailing_dot(punycode(fqdn)))",
+    "dns_record_node": "sha256(lowercase_fqdn + '|' + record_type.upper() + '|' + normalized_value + '|' + str(floor(ttl/300)*300))",
+    "http_result_node": "sha256(lowercase_fqdn + '|' + str(port) + '|' + str(status_code) + '|' + structural_fingerprint_512b)",
+    "neo4j_edge": "source_node_key + '|' + relationship_type + '|' + target_node_key",
+    "clickhouse_row": "ReplacingMergeTree ORDER BY (fqdn, scan_type, toStartOfHour(scan_ts)) version=unix_ts_ingest"
+  },
+
+  "normalization_requirements": {
+    "fqdn": ["lowercase", "strip_trailing_dot", "punycode_convert_idn"],
+    "ip_address": ["canonical_form_no_leading_zeros"],
+    "cname_value": ["lowercase"],
+    "record_type": ["uppercase"],
+    "port": ["integer_normalize_implicit_80_http_443_https"],
+    "body_fingerprint": ["first_512_bytes", "strip_session_patterns", "sha256_prefix_64"]
+  },
+
+  "idempotency_contracts": {
+    "neo4j_node_create": "MERGE ON CREATE SET — idempotent",
+    "neo4j_node_update": "MERGE ON MATCH SET n.prop = $val — idempotent; FORBIDDEN: ON MATCH SET n.list += $val",
+    "neo4j_relationship": "MERGE (a)-[r:TYPE]->(b) — idempotent IF both endpoints exist; FORBIDDEN: relationship MERGE without endpoint pre-confirmation",
+    "neo4j_transaction": "Atomic batch of ≤500 ops; full rollback on any error; safe to retry",
+    "clickhouse_insert": "NOT idempotent by default; duplicates persist until background merge; use checkpoint store to prevent double-insert; FINAL in all reconciliation queries"
+  },
+
+  "rollback_boundaries": {
+    "neo4j": {
+      "boundary": "transaction (batch of ≤500 MERGE ops)",
+      "on_failure": "full_rollback",
+      "retry_action": "retry_full_batch"
+    },
+    "clickhouse": {
+      "boundary": "no_native_transaction",
+      "on_failure": "re_insert_entire_batch",
+      "dedup_handling": "ReplacingMergeTree background merge; FINAL in queries",
+      "retry_action": "re_insert_batch; mark for reconciliation pass"
+    },
+    "inter_store": {
+      "boundary": "checkpoint WAL record",
+      "on_crash_between_neo4j_and_clickhouse": "checkpoint status=PENDING detected; resume from checkpoint; insert ClickHouse only",
+      "on_neo4j_failure": "skip ClickHouse write; route batch to ingest-DLQ"
+    }
+  },
+
+  "validation_suite": {
+    "suite_1_duplicate_detection": {
+      "neo4j_subdomain_dupe": "MATCH (n:Subdomain) WITH n.name AS name, count(n) AS cnt WHERE cnt > 1 RETURN name, cnt ORDER BY cnt DESC LIMIT 100",
+      "neo4j_dns_dupe": "MATCH (n:Subdomain)-[:HAS_DNS]->(d:DnsRecord) WITH n.name AS fqdn, d.record_type AS rtype, d.value AS rval, count(d) AS cnt WHERE cnt > 1 RETURN fqdn, rtype, rval, cnt ORDER BY cnt DESC LIMIT 100",
+      "clickhouse_dupe": "SELECT fqdn, scan_type, toStartOfHour(scan_ts) AS hour, count(*) AS cnt FROM subdomains WHERE scan_ts >= now() - INTERVAL 1 HOUR GROUP BY fqdn, scan_type, hour HAVING cnt > 1 ORDER BY cnt DESC LIMIT 100",
+      "expected": "zero_results"
+    },
+    "suite_2_cross_store_reconciliation": {
+      "neo4j_query": "MATCH (n:Subdomain) WHERE n.ingested_batch_id = $batch_id RETURN count(n) AS neo4j_count",
+      "clickhouse_query": "SELECT count(*) AS ch_count FROM subdomains FINAL WHERE ingested_batch_id = %(batch_id)s",
+      "settle_delay_sec": 30,
+      "pass_threshold_pct": 0.005,
+      "fail_action": "quarantine_batch AND pause_ingest AND ors_critical_alert",
+      "frequency": "after_every_ingest_batch"
+    },
+    "suite_3_orphan_detection": {
+      "neo4j_orphan_subdomains": "MATCH (n:Subdomain) WHERE NOT (n)-[:HAS_DNS]->() AND n.created_at < datetime() - duration('PT1H') RETURN count(n) AS orphan_count",
+      "neo4j_orphan_dns_records": "MATCH (d:DnsRecord) WHERE NOT ()-[:HAS_DNS]->(d) RETURN count(d) AS orphan_dns_count",
+      "expected": "zero"
+    },
+    "suite_4_partial_write_detection": {
+      "method": "controller_level_sample_join",
+      "sample_rate": 0.01,
+      "ch_query": "SELECT DISTINCT fqdn FROM subdomains FINAL WHERE scan_ts >= now() - INTERVAL 1 HOUR ORDER BY rand() LIMIT 1000",
+      "neo4j_verify": "MATCH (n:Subdomain {name: $fqdn}) RETURN count(n)",
+      "expected": "count = 1 for all sampled fqdns"
+    },
+    "suite_5_checkpoint_integrity": {
+      "stale_pending_query": "SELECT batch_id, lane, status, ts FROM checkpoints WHERE status = 'PENDING' AND ts < datetime('now', '-5 minutes') ORDER BY ts ASC",
+      "incomplete_query": "SELECT count(*) AS incomplete FROM checkpoints WHERE status != 'COMPLETE' AND status != 'QUARANTINED' AND ts < datetime('now', '-15 minutes')",
+      "frequency": "every_60_seconds",
+      "expected": "zero_results"
+    },
+    "suite_6_idempotency_replay_test": {
+      "procedure": ["select_known_good_batch", "re_run_full_ingest_pipeline_on_batch", "run_suite_1_expect_zero_duplicates", "verify_neo4j_only_last_seen_changed", "verify_ch_count_unchanged_after_merge"],
+      "frequency": "before_concurrency_ramp AND after_any_ingest_code_change",
+      "expected": "zero_new_duplicates"
+    },
+    "suite_7_rollback_verification": {
+      "neo4j_query": "MATCH (n:Subdomain) WHERE n.ingested_batch_id = $failed_batch_id RETURN count(n)",
+      "clickhouse_query": "SELECT count(*) FROM subdomains FINAL WHERE ingested_batch_id = %(failed_batch_id)s",
+      "expected": "zero (transaction rolled back, ClickHouse write skipped)"
+    }
+  },
+
+  "ors_monitors": [
+    {"signal": "stale_pending_checkpoint_minutes", "warning": 3, "critical": 5, "reflex_warning": "alert_mattermost", "reflex_critical": "halt_ingest_alert"},
+    {"signal": "reconciliation_mismatch_pct", "warning": 0.002, "critical": 0.005, "reflex_warning": "alert_log", "reflex_critical": "pause_ingest_quarantine_batch_alert"},
+    {"signal": "neo4j_orphan_subdomain_count", "warning": 1, "critical": 10, "reflex_warning": "alert", "reflex_critical": "pause_ingest_alert"},
+    {"signal": "ch_orphan_row_sample_count", "warning": 1, "critical": 5, "reflex_warning": "alert", "reflex_critical": "halt_ingest_alert"},
+    {"signal": "quarantine_item_count", "warning": 1000, "critical": 10000, "reflex_warning": "alert_mattermost", "reflex_critical": "alert_and_review"}
+  ],
+
+  "pre_ramp_gates": [
+    "suite_1_zero_duplicates",
+    "suite_3_zero_orphans",
+    "suite_5_zero_stale_checkpoints",
+    "suite_6_idempotency_replay_pass",
+    "suite_7_rollback_verification_pass"
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "Accumulating property SET breaks idempotency", "severity": "high", "probability": "medium", "mitigation": "Code audit: find all ON MATCH SET += patterns; replace with = before concurrency ramp"},
+    {"id": "R2", "title": "Dynamic body content creates duplicate HTTP nodes", "severity": "high", "probability": "high", "mitigation": "Structural body fingerprint (first 512B stripped) instead of full body hash"},
+    {"id": "R3", "title": "Relationship MERGE creates implicit nodes", "severity": "high", "probability": "low", "mitigation": "Endpoint pre-confirmation guard before every relationship MERGE"},
+    {"id": "R4", "title": "Cross-store drift undetected between batches", "severity": "high", "probability": "medium", "mitigation": "Per-batch reconciliation in validate lane; not end-of-run"},
+    {"id": "R5", "title": "ClickHouse FINAL cost spike under heavy load", "severity": "medium", "probability": "high", "mitigation": "Schedule full-table FINAL queries off-peak; per-batch FINAL on small batch windows is acceptable"},
+    {"id": "R6", "title": "Stale PENDING checkpoints from crashed sessions", "severity": "medium", "probability": "medium", "mitigation": "ORS monitor: PENDING > 5 min = CRITICAL; resume procedure defined"},
+    {"id": "R7", "title": "ClickHouse orphan rows from write-order violation", "severity": "high", "probability": "low_if_contract_enforced", "mitigation": "Write order enforced as code contract; Suite 4 detects post-facto"},
+    {"id": "R8", "title": "fqdn normalization inconsistency across code paths", "severity": "medium", "probability": "medium", "mitigation": "Single normalization function at Controller ingest boundary; never normalize at DB layer"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Code audit: replace all ON MATCH SET += with = in Neo4j write code before concurrency ramp"},
+    {"priority": 2, "id": "REC-02", "action": "Replace HTTP result body fingerprint with structural fingerprint of first 512B stripped of session patterns"},
+    {"priority": 3, "id": "REC-03", "action": "Add endpoint pre-confirmation guard before every Neo4j relationship MERGE"},
+    {"priority": 4, "id": "REC-04", "action": "Add ingested_batch_id to both Neo4j node properties and ClickHouse rows during write path"},
+    {"priority": 5, "id": "REC-05", "action": "Implement Suite 2 reconciliation in validate lane with FINAL keyword and 30s settle delay"},
+    {"priority": 6, "id": "REC-06", "action": "Implement all 7 validation suites; integrate Suite 1, 5 as continuous ORS monitors"},
+    {"priority": 7, "id": "REC-07", "action": "Run Suite 6 idempotency replay test; must pass with zero duplicates before concurrency ramp"},
+    {"priority": 8, "id": "REC-08", "action": "Add ORS monitor for stale PENDING checkpoints: WARNING 3 min, CRITICAL 5 min"},
+    {"priority": 9, "id": "REC-09", "action": "Enforce single fqdn normalization function at Controller ingest boundary (lowercase, strip dot, punycode)"},
+    {"priority": 10, "id": "REC-10", "action": "Add ORS DLQ depth monitor per lane: WARNING 500, CRITICAL 2000 items"}
+  ],
+
+  "metrics": {
+    "reconciliation_mismatch_max_pct": 0.005,
+    "duplicate_suppression_accuracy_min": 0.99,
+    "validation_runtime_per_batch_max_min": 15,
+    "orphan_node_count_max": 0,
+    "stale_pending_checkpoint_max_min": 5,
+    "partial_write_orphan_ch_rows_max": 0
+  },
+
+  "assumptions": [
+    "A1: Controller has write access to both Neo4j and ClickHouse from a single process",
+    "A2: Neo4j supports MERGE semantics (version >= 3.x)",
+    "A3: ClickHouse table uses ReplacingMergeTree with version column (monotonically increasing Unix timestamp)",
+    "A4: ingested_batch_id field can be added to Neo4j node properties and ClickHouse rows without breaking existing schema",
+    "A5: ClickHouse version >= 21.6 (FINAL keyword available)",
+    "A6: Checkpoint store accessible from Controller at all times; failure halts ingest",
+    "A7: fqdn normalization at Controller boundary does not break existing data (existing data can be re-normalized without re-keying)"
+  ]
+}
