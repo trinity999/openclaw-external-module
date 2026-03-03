@@ -1,0 +1,260 @@
+{
+  "work_order": "WO-00002",
+  "category": "correlation",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.93,
+
+  "key_findings": [
+    "Day-1 concurrency envelopes (DNS:250, HTTP:75, Enrich:25, Ingest:15 tx) are confirmed as the correct operational starting point for the 200k chunk; no tuning required before first pass",
+    "Redis Bloom filter must be deployed and pre-warmed before first production write — this is the single highest-risk pre-flight step; skipping it will cause duplicate write rates to exceed 0.5% target",
+    "Write order must be enforced as a code contract: Neo4j writes BEFORE ClickHouse writes — this prevents ClickHouse orphan rows on Neo4j failure",
+    "Per-batch cross-store reconciliation (validate lane) must fire after every ingest batch, not end-of-run — early detection prevents ingesting millions of corrupt records before discovery",
+    "Retry logic must be pinned at the tool layer (dnsx/httpx task level), not the queue layer — queue-level retry causes DLQ thrashing and queue depth inflation under error conditions",
+    "Quarantine protocol must be in place before first run — all integrity-class failures require forensic replay path; silent discard is not acceptable",
+    "ClickHouse reconciliation queries must use FINAL keyword — without FINAL, ReplacingMergeTree dedup lag causes false mismatch alarms in validate lane",
+    "Checkpoint must be written BEFORE datastore write, not after — post-write checkpoints create double-write exposure on retry"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Retry pinned at tool layer",
+      "summary": "dnsx/httpx/ingest retries execute in-process at tool level; failures beyond max retries escalate to DLQ — not re-enqueued to primary queue",
+      "rationale": "Queue-level retry causes queue depth inflation and backpressure instability; tool-layer retry is bounded and does not affect AWSEM queue metrics",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Neo4j-first write order enforced as code contract",
+      "summary": "ClickHouse write is skipped if Neo4j write fails; Neo4j is the graph authority",
+      "rationale": "Prevents ClickHouse orphan rows that would appear in telemetry but have no corresponding graph node; validate lane reconciliation would flag these as mismatch",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D3",
+      "title": "Checkpoint written before datastore write (write-ahead)",
+      "summary": "WAL checkpoint record created with status=PENDING before any datastore write; updated to COMPLETE after both writes succeed",
+      "rationale": "Post-write checkpoints allow double-write on retry; pre-write checkpoints guarantee safe replay at the cost of a small idempotency overhead (absorbed by MERGE semantics)",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D4",
+      "title": "Per-batch validate lane reconciliation with 30s settle delay",
+      "summary": "Validate lane fires after each ingest batch; 30s settle delay before ClickHouse query to allow ReplacingMergeTree merge to complete",
+      "rationale": "Without settle delay, FINAL keyword may not fully resolve all dedup operations in high-insert-rate conditions; 30s is conservative and safe for current batch sizes",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Quarantine-not-discard for all failure classes",
+      "summary": "All failed items written to artifacts/quarantine/{batch_id}_{lane}_{ts}/ with full forensic context",
+      "rationale": "Intelligence value of quarantined items may be recoverable; silent discard is irreversible and may cause coverage gaps in subdomain intelligence corpus",
+      "stability_impact": "neutral"
+    },
+    {
+      "id": "D6",
+      "title": "Bloom filter FPR at 0.01%",
+      "summary": "Redis Bloom filter configured for 10M expected insertions at 0.01% false positive rate; ~240MB bit array, 14 hash functions",
+      "rationale": "0.01% FPR at 10M scale = ~1,000 false positives (valid subdomains incorrectly skipped); recoverable via DLQ replay; lower FPR would double memory footprint",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D7",
+      "title": "DNS-gate before HTTP lane activation",
+      "summary": "HTTP lane does not activate until DNS validation pass: error rate ≤2%, dupe rate ≤0.5%, link accuracy ≥99.5%",
+      "rationale": "Prevents HTTP probing on unconfirmed DNS data; eliminates dangling HTTP graph edges with no DNS node parent",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D8",
+      "title": "Per-lane DLQ with class-specific TTL",
+      "summary": "dns-dlq:48h, http-dlq:48h, enrich-dlq:72h, ingest-dlq:168h, validate-dlq:168h",
+      "rationale": "Longer TTL on ingest/validate DLQ because those items require manual forensic investigation; shorter TTL on DNS/HTTP because re-scanning is a valid recovery path",
+      "stability_impact": "neutral"
+    }
+  ],
+
+  "execution_matrix": {
+    "dns_lane": {
+      "executor": "Oracle (dnsx)",
+      "concurrency_day1": 250,
+      "concurrency_step_thresholds": [
+        {"step": 350, "condition": "24h stable: error_rate<=0.01, dupe_rate<=0.005"},
+        {"step": 500, "condition": "48h stable: all_ors_signals_green"}
+      ],
+      "checkpoint_batch_size": 5000,
+      "retry_pin": "tool_layer",
+      "retry_max": 3,
+      "retry_backoff_sec": [1, 5, 15],
+      "rate_limit_action": "suspend_60s_reduce_concurrency_20pct",
+      "escalation": "dns-dlq after max retries",
+      "queue_high_water_mark": 50000,
+      "queue_low_water_mark": 25000,
+      "queue_max_depth": 200000,
+      "item_ttl_hours": 4,
+      "kril_integrated": true,
+      "expected_throughput_per_hr": 900000,
+      "expected_duration_200k_min": 14
+    },
+    "http_lane": {
+      "executor": "Oracle (httpx)",
+      "activation_gate": "dns_checkpoint_confirmed AND dns_error_rate<=0.02 AND link_accuracy>=0.995",
+      "concurrency_day1": 75,
+      "concurrency_step_thresholds": [
+        {"step": 100, "condition": "dns_gate_passed AND http_error_rate<=0.05"},
+        {"step": 150, "condition": "post_benchmarking_stable"}
+      ],
+      "checkpoint_batch_size": 2000,
+      "retry_pin": "tool_layer",
+      "retry_max_5xx": 2,
+      "retry_backoff_5xx_sec": [5, 30],
+      "retry_max_429": 1,
+      "retry_backoff_429_sec": 60,
+      "redirect_follow_max_hops": 3,
+      "escalation": "http-dlq after max retries",
+      "queue_high_water_mark": 20000,
+      "queue_low_water_mark": 10000,
+      "queue_max_depth": 80000,
+      "item_ttl_hours": 4,
+      "dedup_key": "sha256(subdomain|port|status_code|body_hash_prefix_64)",
+      "expected_targets_from_200k": "50000-80000",
+      "expected_throughput_per_hr": 60000
+    },
+    "enrich_lane": {
+      "executor": "Oracle (nuclei/katana/ECE)",
+      "activation_gate": "http_checkpoint_confirmed AND target_is_http_active",
+      "concurrency_day1": 25,
+      "checkpoint_batch_size": 500,
+      "retry_pin": "sub_task_level",
+      "retry_max_nuclei_katana": 2,
+      "retry_backoff_sec": 30,
+      "retry_max_ece_fetch": 3,
+      "retry_backoff_ece_sec": "exponential",
+      "escalation": "enrich-dlq after max retries",
+      "queue_high_water_mark": 5000,
+      "queue_low_water_mark": 2500,
+      "queue_max_depth": 20000,
+      "item_ttl_hours": 8,
+      "expected_candidates_from_200k": "5000-20000"
+    },
+    "ingest_lane": {
+      "executor": "Controller (Neo4j + ClickHouse)",
+      "neo4j_concurrency_tx": 15,
+      "neo4j_ops_per_tx": 500,
+      "neo4j_write_semantics": "MERGE ON CREATE/MATCH",
+      "clickhouse_batch_size_rows": 5000,
+      "clickhouse_flush_interval_sec": 10,
+      "write_order": "neo4j_first_then_clickhouse",
+      "checkpoint_timing": "write_ahead_before_datastore",
+      "bloom_filter": {
+        "expected_insertions": 10000000,
+        "false_positive_rate": 0.0001,
+        "estimated_bit_array_mb": 240,
+        "hash_functions": 14,
+        "pre_warm_required": true
+      },
+      "retry_pin": "ingest_controller_level",
+      "retry_max_neo4j": 2,
+      "retry_backoff_neo4j_sec": 5,
+      "retry_max_clickhouse": 2,
+      "retry_backoff_clickhouse_sec": 10,
+      "escalation": "ingest-dlq after max retries",
+      "corruption_action": "HALT_INGEST_FORENSIC_LOG",
+      "queue_high_water_mark": 2000,
+      "queue_low_water_mark": 1000,
+      "queue_max_depth": 10000,
+      "item_ttl_hours": 2
+    },
+    "validate_lane": {
+      "executor": "Controller",
+      "concurrency_workers": 3,
+      "trigger": "after_every_ingest_batch",
+      "settle_delay_sec": 30,
+      "neo4j_query": "MATCH (n:Subdomain) WHERE n.ingested_batch_id = $batch_id RETURN count(n)",
+      "clickhouse_query": "SELECT count(*) FROM subdomains FINAL WHERE ingested_batch_id = %(batch_id)s",
+      "pass_threshold_mismatch_pct": 0.005,
+      "warn_threshold_mismatch_pct": 0.002,
+      "fail_action": "pause_ingest AND quarantine_batch AND ors_critical_alert",
+      "queue_max_depth": 500,
+      "item_ttl_hours": 1
+    }
+  },
+
+  "quarantine_protocol": {
+    "base_path": "artifacts/quarantine/",
+    "naming_pattern": "{batch_id}_{lane}_{unix_ts}",
+    "contents": ["raw_payload.json", "failure_reason.json", "checkpoint_state.json", "retry_eligible.bool"],
+    "classes": {
+      "transient": {"quarantine": true, "retry_eligible": true, "auto_action": "re_enqueue_after_backoff"},
+      "rate_limited": {"quarantine": true, "retry_eligible": true, "auto_action": "reduce_concurrency_20pct_and_cooldown"},
+      "datastore_error": {"quarantine": true, "retry_eligible": true, "auto_action": "dlq_after_max_retries"},
+      "integrity_error": {"quarantine": true, "retry_eligible": false, "auto_action": "ors_alert_manual_review"},
+      "corruption_risk": {"quarantine": true, "retry_eligible": false, "auto_action": "halt_ingest_forensic_log"}
+    },
+    "retention_days": 30,
+    "ors_alert_threshold_items": 10000
+  },
+
+  "consistency_verification": {
+    "method": "per_batch_cross_store_reconciliation",
+    "neo4j_query_template": "MATCH (n:Subdomain) WHERE n.ingested_batch_id = $batch_id RETURN count(n)",
+    "clickhouse_query_template": "SELECT count(*) FROM subdomains FINAL WHERE ingested_batch_id = %(batch_id)s",
+    "settle_delay_sec": 30,
+    "pass_threshold": 0.005,
+    "warn_threshold": 0.002,
+    "fail_action": "pause_ingest AND quarantine AND ors_critical",
+    "required_field": "ingested_batch_id on both Neo4j node properties and ClickHouse rows"
+  },
+
+  "ors_additions": [
+    {"signal": "dlq_depth_per_lane", "warning_items": 500, "critical_items": 2000, "reflex_warning": "alert_mattermost", "reflex_critical": "alert_mattermost_pause_ingest"},
+    {"signal": "reconciliation_mismatch_pct", "warning": 0.002, "critical": 0.005, "reflex_warning": "alert_log", "reflex_critical": "pause_ingest_quarantine_batch"},
+    {"signal": "bloom_filter_skip_rate", "warning": 0.003, "critical": 0.01, "reflex_warning": "investigate_dedup_keys", "reflex_critical": "halt_ingest_key_audit"},
+    {"signal": "checkpoint_pending_age_min", "warning": 3, "critical": 5, "reflex_warning": "alert", "reflex_critical": "halt_ingest_investigate"},
+    {"signal": "quarantine_item_count", "warning": 1000, "critical": 10000, "reflex_warning": "alert_mattermost", "reflex_critical": "alert_and_review"}
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "Bloom filter not pre-warmed", "severity": "high", "probability": "high_if_skipped", "mitigation": "Block production start on warm confirmation; verify item count matches known subdomain inventory"},
+    {"id": "R2", "title": "ClickHouse orphan rows on Neo4j failure", "severity": "medium", "probability": "low", "mitigation": "Enforced Neo4j-first write order; validate lane cross-store check catches post-facto"},
+    {"id": "R3", "title": "DLQ growing unbounded", "severity": "medium", "probability": "medium", "mitigation": "Per-lane DLQ TTL enforcement; ORS alert on DLQ depth > 2,000 items"},
+    {"id": "R4", "title": "ClickHouse dedup lag causing false reconciliation alarms", "severity": "low", "probability": "high_first_24h", "mitigation": "30s settle delay before reconciliation query; FINAL keyword in all count queries"},
+    {"id": "R5", "title": "Checkpoint store (Redis) failure", "severity": "high", "probability": "low", "mitigation": "Redis AOF persistence; SQLite WAL fallback; checkpoint failure = halt ingest"},
+    {"id": "R6", "title": "Quarantine directory growing without cleanup", "severity": "low", "probability": "medium", "mitigation": "30-day retention with auto-archive; ORS alert at 10k items"},
+    {"id": "R7", "title": "Bloom filter false positive silently suppressing valid subdomains", "severity": "medium", "probability": "low", "mitigation": "At 0.01% FPR and 10M items: ~1,000 false positives; recoverable via DLQ replay after Bloom filter reset"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Deploy and warm Redis Bloom filter before first production write — block start on warm confirmation"},
+    {"priority": 2, "id": "REC-02", "action": "Enforce Neo4j-first write order in ingest controller code with explicit code contract comment"},
+    {"priority": 3, "id": "REC-03", "action": "Create artifacts/quarantine/ directory and implement quarantine writer before first run"},
+    {"priority": 4, "id": "REC-04", "action": "Implement validate lane reconciliation with FINAL keyword and 30s settle delay; add ingested_batch_id to both Neo4j and ClickHouse write paths"},
+    {"priority": 5, "id": "REC-05", "action": "Add per-lane DLQ depth ORS monitor: WARNING 500, CRITICAL 2000"},
+    {"priority": 6, "id": "REC-06", "action": "Run 200k chunk DNS-only first; gate HTTP on DNS validation pass (error<=2%, dupe<=0.5%)"},
+    {"priority": 7, "id": "REC-07", "action": "After successful 200k full-pipeline cycle: step DNS concurrency 250→350; monitor 2h before next step"},
+    {"priority": 8, "id": "REC-08", "action": "Export per-lane throughput and DLQ metrics to Mattermost OPS channel after each 5,000-item batch"}
+  ],
+
+  "metrics": {
+    "dns_throughput_target_per_hr": 500000,
+    "http_throughput_target_per_hr": 50000,
+    "ingest_throughput_target_per_hr": 200000,
+    "duplicate_write_rate_max": 0.005,
+    "integrity_score_min": 0.995,
+    "lane_recovery_rto_minutes_max": 10,
+    "dlq_accumulation_per_lane_per_run_max": 500,
+    "model_escalation_rate_max": 0.05,
+    "reconciliation_mismatch_pct_max": 0.005,
+    "bloom_filter_false_positive_rate": 0.0001
+  },
+
+  "assumptions": [
+    "A1: Oracle produces SHA-256 hash files alongside source chunk data for source integrity verification",
+    "A2: Redis deployed on Controller with AOF persistence enabled",
+    "A3: AWSEM supports per-partition queue depth signals accessible by ORS",
+    "A4: ClickHouse version >= 21.6 (FINAL keyword available); if not, use GROUP BY dedup in reconciliation",
+    "A5: ingested_batch_id field is added to Neo4j node properties and ClickHouse rows during ingest write path",
+    "A6: Bloom filter false positive rate of 0.01% is acceptable (~1,000 valid subdomains may be incorrectly skipped at 10M scale; recoverable)"
+  ]
+}
