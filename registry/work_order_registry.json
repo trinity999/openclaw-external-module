@@ -173,17 +173,25 @@
       "id": "WO-00015",
       "category": "analysis",
       "priority": "high",
-      "state": "awaiting_analysis",
+      "state": "completed",
       "created_at": "2026-03-03T22:50:25Z",
-      "enrichment": "WOEP_v1_applied"
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-03T23:30:03Z",
+      "artifact_report": "artifacts/WO-00015/report.md",
+      "artifact_structured": "artifacts/WO-00015/structured_output.json",
+      "confidence": "pending_ingestion_review"
     },
     {
       "id": "WO-00016",
       "category": "correlation",
       "priority": "high",
-      "state": "awaiting_analysis",
+      "state": "completed",
       "created_at": "2026-03-03T22:50:25Z",
-      "enrichment": "WOEP_v1_applied"
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-03T23:30:03Z",
+      "artifact_report": "artifacts/WO-00016/report.md",
+      "artifact_structured": "artifacts/WO-00016/structured_output.json",
+      "confidence": "pending_ingestion_review"
     },
     {
       "id": "WO-00017",
@@ -197,9 +205,13 @@
       "id": "WO-00018",
       "category": "architecture",
       "priority": "high",
-      "state": "awaiting_analysis",
+      "state": "completed",
       "created_at": "2026-03-03T22:50:25Z",
-      "enrichment": "WOEP_v1_applied"
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-03T23:30:03Z",
+      "artifact_report": "artifacts/WO-00018/report.md",
+      "artifact_structured": "artifacts/WO-00018/structured_output.json",
+      "confidence": "pending_ingestion_review"
     }
   ]
 }
