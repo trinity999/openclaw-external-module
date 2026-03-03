@@ -1,0 +1,270 @@
+{
+  "work_order": "WO-00004",
+  "category": "research",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.88,
+
+  "key_findings": [
+    "Cheapest-capable-first routing across 9 task families achieves >=31% cost reduction vs. untuned T2 baseline and >=86% vs. premium-only — well exceeding the 20% target",
+    "KRIL selective mode is the highest-leverage token spend reduction: gating F4/F6/F7 to top 50/30/20 percentile targets respectively eliminates 60-70% of analytical task invocations",
+    "ORS reflex (F8) must route to T1 only with predefined fallback — latency constraint (< 2s) overrides quality; escalation is never acceptable for reflex tasks",
+    "F5 KRIL scoring must run in batches of 50 targets per T2 call — single-target scoring is 50x more expensive per insight with no quality improvement",
+    "Confidence-based escalation requires models to emit a structured confidence field — routing cannot escalate on confidence without a measurable signal; schema/template validation substitutes for F1/F3",
+    "F6 enrichment interpretation escalates to T3 with zero T2 retries — enrichment uncertainty indicates a novel finding class which T2 cannot resolve; immediate T3 is cost-effective at F6 volume",
+    "Premium escalation rate tracking must use a rolling 1-hour window with spike tolerance (8% for <= 10 min) — per-session tracking is too coarse for 72h operation burst events",
+    "routing_policy.json must be a versioned config file; routing logic must not be hardcoded in application code to allow threshold adjustment without deployment"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Nine task family taxonomy with tier assignment",
+      "summary": "F1-F3 route T1; F4-F7 route T2 with T3 escalation; F8 routes T1 with fallback; F9 routes T3 direct",
+      "rationale": "Structural tasks (F1-F3) have deterministic outputs verifiable by schema — T1 is sufficient; analytical tasks (F4-F7) require reasoning — T2 default with escalation path; F8 latency-constrained; F9 rare and deep",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "KRIL score as task routing modifier",
+      "summary": "High-KRIL targets bypass T1 for F2 (route direct T2); low-KRIL targets suppress F4/F6/F7 entirely",
+      "rationale": "KRIL provides the best available signal for which targets deserve expensive analysis; uniform spend regardless of target value wastes budget on low-value findings",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "ORS reflex never escalates",
+      "summary": "F8 routes T1 only; fallback action is predefined safe reflex (suspend lane); no T2/T3 for reflex path",
+      "rationale": "Reflex latency requirement (< 2s) is incompatible with T2/T3 invocation time; a correct slow response is worse than a fast safe default for operational reflexes",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D4",
+      "title": "F6 zero retries before T3 escalation",
+      "summary": "Enrichment interpretation escalates to T3 immediately on T2 uncertainty — no T2 retry",
+      "rationale": "T2 uncertainty on enrichment signals a novel finding class; a second T2 call with the same context is unlikely to resolve; T3 is appropriate and F6 volume is small",
+      "stability_impact": "neutral"
+    },
+    {
+      "id": "D5",
+      "title": "F5 batch scoring at 50 targets per call",
+      "summary": "KRIL ranking task processes 50 targets per T2 call; single-target scoring is prohibited",
+      "rationale": "Batch scoring amortizes context-window and per-call overhead across 50 targets; single-target scoring multiplies cost by 50x with no quality improvement",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D6",
+      "title": "Rolling 1h escalation budget with spike tolerance",
+      "summary": "Premium rate budget tracked in rolling 1-hour window; 8% spike allowed for <= 10 minutes; sustained > 5% triggers throttle",
+      "rationale": "Anomaly clusters generate legitimate T3 spikes; flat 5% hard cap would reject valid escalations during burst events; spike tolerance prevents false throttling",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D7",
+      "title": "routing_policy.json as versioned external config",
+      "summary": "All routing thresholds, tier assignments, and KRIL gates defined in routing_policy.json; controller reads at startup",
+      "rationale": "Threshold tuning at 24h operational review must not require code deployment; external config allows hot adjustment",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D8",
+      "title": "T3 queue on budget exhaustion, not rejection",
+      "summary": "When premium escalation rate >= 5%, new T3 invocations are queued asynchronously rather than rejected",
+      "rationale": "Rejecting T3 on budget exhaustion loses high-value analytical output; queuing defers cost to next budget window while preserving results",
+      "stability_impact": "neutral"
+    }
+  ],
+
+  "task_families": {
+    "F1": {
+      "name": "Structured Parsing",
+      "volume_pct": 35,
+      "default_tier": "T1",
+      "escalation_target": "T2",
+      "escalation_condition": "schema_validation_fail",
+      "max_escalation_tier": "T2",
+      "max_retries_before_escalation": 1,
+      "confidence_gate": "schema_only",
+      "kril_gate_threshold": null,
+      "token_budget_input": 500,
+      "token_budget_output": 200
+    },
+    "F2": {
+      "name": "Alert Triage / Classification",
+      "volume_pct": 20,
+      "default_tier": "T1",
+      "escalation_target": "T2",
+      "escalation_condition": "confidence_lt_threshold OR label_not_in_set",
+      "max_escalation_tier": "T2",
+      "max_retries_before_escalation": 0,
+      "confidence_threshold_T1": 0.70,
+      "confidence_threshold_T2": 0.85,
+      "kril_direct_T2_threshold": 90,
+      "token_budget_input": 300,
+      "token_budget_output": 50
+    },
+    "F3": {
+      "name": "Status / Batch Reporting",
+      "volume_pct": 12,
+      "default_tier": "T1",
+      "escalation_target": "T2",
+      "escalation_condition": "template_validation_fail",
+      "max_escalation_tier": "T2",
+      "max_retries_before_escalation": 1,
+      "confidence_gate": "template_only",
+      "kril_gate_threshold": null,
+      "token_budget_input": 1000,
+      "token_budget_output": 500,
+      "frequency": "per_batch_completion AND hourly"
+    },
+    "F4": {
+      "name": "HTTP Response Pattern Analysis",
+      "volume_pct": 10,
+      "default_tier": "T2",
+      "escalation_target": "T3",
+      "escalation_condition": "confidence_lt_0.65 OR contradictory_signals",
+      "max_retries_before_escalation": 1,
+      "confidence_threshold_T2": 0.65,
+      "kril_invoke_threshold": 50,
+      "token_budget_input": 2000,
+      "token_budget_output": 500
+    },
+    "F5": {
+      "name": "KRIL Target Ranking / Scoring",
+      "volume_pct": 8,
+      "default_tier": "T2",
+      "escalation_condition": "score_range_lt_40pts",
+      "escalation_action": "retry_T2_different_prompt",
+      "batch_size_targets": 50,
+      "confidence_gate": "distribution_range_check",
+      "token_budget_input": 3000,
+      "token_budget_output": 500
+    },
+    "F6": {
+      "name": "Enrichment Finding Interpretation",
+      "volume_pct": 7,
+      "default_tier": "T2",
+      "escalation_target": "T3",
+      "escalation_condition": "confidence_lt_0.60 OR class_unknown",
+      "max_retries_before_escalation": 0,
+      "confidence_threshold_T2": 0.60,
+      "kril_invoke_threshold": 70,
+      "token_budget_input": 4000,
+      "token_budget_output": 1000
+    },
+    "F7": {
+      "name": "Anomaly Investigation",
+      "volume_pct": 5,
+      "default_tier": "T2",
+      "escalation_target": "T3",
+      "escalation_condition": "confidence_lt_0.55 OR anomaly_score_gte_0.80",
+      "max_retries_before_escalation": 0,
+      "confidence_threshold_T2": 0.55,
+      "anomaly_score_direct_T3": 0.80,
+      "kril_invoke_threshold": 80,
+      "kril_direct_T3_threshold": 95,
+      "kril_direct_T3_anomaly_threshold": 0.75,
+      "token_budget_input": 8000,
+      "token_budget_output": 2000
+    },
+    "F8": {
+      "name": "ORS Real-Time Reflex",
+      "volume_pct": 2,
+      "default_tier": "T1",
+      "escalation_policy": "never",
+      "fallback_action": "suspend_lane",
+      "max_latency_ms": 2000,
+      "confidence_gate": "closed_set_validation",
+      "token_budget_input": 200,
+      "token_budget_output": 100
+    },
+    "F9": {
+      "name": "Architecture / Critical Decision",
+      "volume_pct": 1,
+      "default_tier": "T3",
+      "human_review_required": true,
+      "token_budget_input": "uncapped",
+      "token_budget_output": "uncapped",
+      "frequency": "on_demand_only"
+    }
+  },
+
+  "escalation_budget": {
+    "premium_rate_target": 0.05,
+    "premium_rate_warning": 0.04,
+    "spike_tolerance_rate": 0.08,
+    "spike_tolerance_window_min": 10,
+    "budget_window_hours": 1,
+    "overflow_policy": "queue_not_reject"
+  },
+
+  "kril_gates": {
+    "F2_direct_T2_threshold": 90,
+    "F4_invoke_threshold": 50,
+    "F6_invoke_threshold": 70,
+    "F7_invoke_threshold": 80,
+    "F7_direct_T3_kril_threshold": 95,
+    "F7_direct_T3_anomaly_threshold": 0.75,
+    "estimated_F4_volume_reduction_pct": 50,
+    "estimated_F6_volume_reduction_pct": 70,
+    "estimated_F7_volume_reduction_pct": 80
+  },
+
+  "cost_model": {
+    "tier_cost_index": {"T1": 1, "T2": 5, "T3": 25},
+    "untuned_T2_baseline_normalized": 500,
+    "premium_only_baseline_normalized": 2500,
+    "routed_policy_normalized": 344,
+    "reduction_vs_T2_baseline_pct": 31,
+    "reduction_vs_premium_only_pct": 86,
+    "token_cost_reduction_vs_baseline_pct_min": 31
+  },
+
+  "ors_additions": [
+    {"signal": "premium_escalation_rate", "warning": 0.04, "critical": 0.05, "reflex_warning": "alert_mattermost", "reflex_critical": "throttle_T3_queue_AND_alert"},
+    {"signal": "F8_reflex_latency_p99_ms", "warning": 1500, "critical": 2000, "reflex_warning": "alert", "reflex_critical": "alert_AND_investigate_T1_latency"},
+    {"signal": "unclassified_task_family_rate", "warning": 0.01, "critical": 0.05, "reflex_warning": "alert", "reflex_critical": "halt_AND_review_routing_table"},
+    {"signal": "T3_queue_depth", "warning": 50, "critical": 200, "reflex_warning": "alert_mattermost", "reflex_critical": "alert_AND_increase_budget_window"}
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "Model confidence field absent", "severity": "high", "probability": "medium", "mitigation": "Require structured output with confidence field; T1 validator model fallback"},
+    {"id": "R2", "title": "T3 escalation burst during anomaly cluster", "severity": "high", "probability": "medium", "mitigation": "Spike tolerance window (8% for <= 10 min); T3 queue on budget exhaustion"},
+    {"id": "R3", "title": "KRIL scores stale under rapid scan expansion", "severity": "medium", "probability": "medium", "mitigation": "Re-rank KRIL after each DNS/HTTP cycle; routing uses latest available score"},
+    {"id": "R4", "title": "Token volumes different from estimate", "severity": "medium", "probability": "medium", "mitigation": "Instrument actual T1/T2/T3 invocation counts from hour 1; adjust thresholds at 24h review"},
+    {"id": "R5", "title": "F5 degenerate score distribution", "severity": "low", "probability": "low", "mitigation": "Distribution range check triggers T2 retry; ORS alert on repeated failures"},
+    {"id": "R6", "title": "ORS reflex predefined fallback too conservative", "severity": "low", "probability": "low", "mitigation": "Review fallback actions quarterly; suspend_lane is always safe default"},
+    {"id": "R7", "title": "Routing table not updated before 72h operation", "severity": "medium", "probability": "low", "mitigation": "routing_policy.json version check at startup; abort if version mismatch vs. expected"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Require structured JSON output with confidence field for all F4-F9 task families"},
+    {"priority": 2, "id": "REC-02", "action": "Add escalation_rate ORS monitor: WARNING 4%, CRITICAL 5%; T3 queue on budget exhaustion"},
+    {"priority": 3, "id": "REC-03", "action": "Set KRIL gate thresholds per routing table and verify KRIL scores are current before 72h operation"},
+    {"priority": 4, "id": "REC-04", "action": "Implement F5 batch scoring (50 targets per T2 call); prohibit single-target KRIL scoring"},
+    {"priority": 5, "id": "REC-05", "action": "Add token cost and T1/T2/T3 call distribution to weekly executive brief"},
+    {"priority": 6, "id": "REC-06", "action": "Run 1h dry-run with routing table active before 72h operation; review escalation rate at 1h mark"},
+    {"priority": 7, "id": "REC-07", "action": "Review actual escalation rate at 24h mark; adjust thresholds if > 4%"},
+    {"priority": 8, "id": "REC-08", "action": "Define routing_policy.json as versioned external config; do not hardcode thresholds in application code"}
+  ],
+
+  "metrics": {
+    "premium_escalation_rate_max": 0.05,
+    "token_cost_reduction_vs_baseline_min_pct": 20,
+    "quality_score_P1_P2_min": 0.90,
+    "F8_reflex_latency_p99_ms_max": 2000,
+    "F2_classification_accuracy_min": 0.95,
+    "F5_score_range_min": 40,
+    "unclassified_task_family_rate_max": 0.01
+  },
+
+  "assumptions": [
+    "A1: Model framework supports three configurable tiers; model IDs set in routing_policy.json",
+    "A2: Models for F4-F9 can emit structured JSON with confidence float; or T1 validator model available to score output",
+    "A3: KRIL scores available at task dispatch time (pre-computed, not real-time)",
+    "A4: ORS has API surface for escalation counter tracking and threshold alert emission",
+    "A5: Controller classifies tasks by type metadata (not content); family classification requires no LLM call",
+    "A6: Limited autonomy means human review available for F9 outputs within 72h window",
+    "A7: Cost index ratio T1:T2:T3 = 1:5:25 is approximate; validate against actual provider pricing"
+  ]
+}
