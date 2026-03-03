@@ -1,0 +1,240 @@
+{
+  "work_order": "WO-00009",
+  "category": "correlation",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.93,
+
+  "key_findings": [
+    "Seven entity types defined with deterministic dedup keys: Domain, Subdomain, IPAddress, Port, HTTPEndpoint, Service, Vulnerability — each anchored by a SHA256 prefix-tagged composite key",
+    "Entity-type prefix in dedup key (e.g., 'domain:' vs 'subdomain:') is mandatory — prevents cross-type key collision when identical string values appear across entity types",
+    "CNAME aliases must be distinct nodes (not collapsed to target) — alias and target can have distinct ownership, findings, and KRIL scores; collapsing corrupts analyst attribution",
+    "SAN_PEER relationship uses MIN/MAX key ordering for structural idempotency — undirected relationship creates same key regardless of which direction is inserted first",
+    "RESOLVES_TO relationship includes batch_id in key — DNS IP assignments change over time; batch_id enables historical tracking while deduplicating within-batch duplicate inserts",
+    "Wildcard DNS detection must run at corpus load time (before queue dispatch) — filtering at parse time is too late; phantom FQDNs waste Oracle scan resources",
+    "Dynamic HTTPEndpoint body_hash: flag dynamic_content=true when body_hash changes between probes; never update body_hash on each probe for dynamic URLs",
+    "Conservative bias: phantom duplication is preferred over phantom collapse — wrong merge hides relationships irreversibly; duplicate nodes are visible and removable",
+    "Reconciliation uses ClickHouse FINAL after 30s settle delay; mismatch threshold ≤ 0.5% — extend settle to 60s if clickhouse_parts_per_table > 300",
+    "Seven-test validation suite covers dedup uniqueness, cross-entity prefix isolation, replay idempotency, CNAME isolation, wildcard suppression, link precision (≥99%), and reconciliation accuracy"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Entity-type prefix in all dedup keys",
+      "summary": "Dedup keys prefixed by entity type: 'domain:', 'subdomain:', 'ip:', 'port:', 'http:', 'service:', 'vuln:'",
+      "rationale": "SHA256('example.com') would collide across Domain and Subdomain for apex domains. Prefix eliminates cross-type collision structurally.",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D2",
+      "title": "CNAME aliases as distinct nodes",
+      "summary": "alias.example.com CNAME target.other.com → two Subdomain nodes + CNAME_TO relationship",
+      "rationale": "Alias and target can have distinct ownership, out-of-scope/in-scope classification, findings, and KRIL scores. Collapsing would corrupt analyst attribution and relationship topology.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "RESOLVES_TO relationship includes batch_id",
+      "summary": "Rel key = SHA256(subdomain_key + '→DNS→' + ip_key + batch_id)[:32] — enables historical IP assignment tracking",
+      "rationale": "DNS IP assignments change. Without batch_id, a second observation of the same (fqdn, ip) pair would be deduped away, losing the temporal record. With batch_id, each batch creates a new relationship record.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "SAN_PEER relationship uses MIN/MAX key ordering",
+      "summary": "Rel key = SHA256(MIN(a_key, b_key) + '→SAN→' + MAX(a_key, b_key))[:32]",
+      "rationale": "SAN co-occurrence is undirected. MIN/MAX ordering ensures the same key is produced regardless of insertion direction, preventing duplicate undirected relationships.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Wildcard DNS suppression at corpus load",
+      "summary": "5 synthetic probes per root domain before scan dispatch; domains with wildcard resolution flagged; FQDN matching wildcard suppressed from ingest queue",
+      "rationale": "Wildcard DNS inflates corpus by resolving all synthetic FQDNs. Detection at corpus load prevents sending millions of phantom FQDNs to Oracle; filtering at parse time is too late and wastes scan resources.",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D6",
+      "title": "Conservative bias: phantom duplication preferred over phantom collapse",
+      "summary": "When dedup confidence is ambiguous, do not merge — create separate nodes and let analyst adjudicate",
+      "rationale": "Wrong merge in Neo4j corrupts graph topology — relationships between entities are merged, hiding distinct attack surface. A phantom duplicate node is visible in reconciliation and safely removable.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D7",
+      "title": "Reconciliation per batch with 30s settle delay",
+      "summary": "Run reconciliation after each AWSEM chunk completion; wait 30s for ClickHouse background merge before FINAL query",
+      "rationale": "Per-record reconciliation is too expensive. Per-hour is too coarse for batch integrity. Per-batch reconciliation provides accurate mismatch detection at ingest batch granularity.",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "entity_model": [
+    {
+      "entity": "Domain",
+      "identity_basis": "eTLD+1 (public suffix list extraction)",
+      "canonical_property": "name",
+      "unique_constraint": true,
+      "dedup_key_formula": "SHA256('domain:' + name.lower())[:32]",
+      "dedup_key_example": "SHA256('domain:example.com')[:32]",
+      "edge_cases": ["Multi-level eTLD (co.uk, com.au) requires PSL library — not naive split"],
+      "properties": ["name", "tld", "registrar", "first_seen", "last_seen"]
+    },
+    {
+      "entity": "Subdomain",
+      "identity_basis": "Normalized FQDN",
+      "canonical_property": "name",
+      "unique_constraint": true,
+      "dedup_key_formula": "SHA256('subdomain:' + fqdn.lower().rstrip('.'))[:32]",
+      "dedup_key_example": "SHA256('subdomain:api.example.com')[:32]",
+      "normalization": ["fqdn.lower()", "strip trailing dot", "preserve www. prefix"],
+      "edge_cases": [
+        "CNAME aliases: create distinct nodes + CNAME_TO relationship; do NOT collapse",
+        "Wildcard DNS: detect 5-probe wildcard; suppress wildcard-matching FQDNs from ingest"
+      ],
+      "properties": ["name", "key_hash", "a_records", "aaaa_records", "cname_chain", "resolved", "kril_score", "asset_risk_score", "first_seen", "last_seen", "ingested_batch_id"]
+    },
+    {
+      "entity": "IPAddress",
+      "identity_basis": "IP address string (normalized)",
+      "canonical_property": "addr",
+      "unique_constraint": true,
+      "dedup_key_formula": "SHA256('ip:' + addr)[:32]",
+      "dedup_key_example": "SHA256('ip:1.2.3.4')[:32]",
+      "normalization": ["IPv4: strip leading zeros", "IPv6: compress to canonical form"],
+      "edge_cases": ["CDN IPs: tag cdn=true if IP in CDN CIDR list; still ingest as valid entity"],
+      "properties": ["addr", "ptr", "asn", "org", "country", "first_seen", "last_seen"]
+    },
+    {
+      "entity": "Port",
+      "identity_basis": "(IPAddress, port_number, protocol) tuple",
+      "canonical_property": null,
+      "unique_constraint": false,
+      "dedup_key_formula": "SHA256('port:' + ip_addr + ':' + port_number + ':' + protocol)[:32]",
+      "dedup_key_example": "SHA256('port:1.2.3.4:443:tcp')[:32]",
+      "properties": ["ip_addr", "port_number", "protocol", "state", "banner", "first_seen", "last_seen"]
+    },
+    {
+      "entity": "HTTPEndpoint",
+      "identity_basis": "(FQDN, canonical_url, method) tuple",
+      "canonical_property": null,
+      "unique_constraint": false,
+      "dedup_key_formula": "SHA256('http:' + fqdn.lower() + '|' + canonical_url + '|' + method.upper())[:32]",
+      "dedup_key_example": "SHA256('http:api.example.com|/v1/users|GET')[:32]",
+      "normalization": [
+        "Strip URL fragment",
+        "Lowercase scheme and host",
+        "Normalize path (resolve .., remove double slashes)",
+        "Sort query params alphabetically",
+        "Strip tracking params (utm_source, utm_medium, fbclid, etc.)"
+      ],
+      "edge_cases": ["Dynamic content: set dynamic_content=true if body_hash changes between probes; do NOT update body_hash on each probe"],
+      "properties": ["fqdn", "url", "method", "status_code", "content_type", "content_length", "title", "body_hash", "redirect_target", "dynamic_content", "first_seen", "last_seen"]
+    },
+    {
+      "entity": "Service",
+      "identity_basis": "(Port, service_name, version) tuple",
+      "canonical_property": null,
+      "unique_constraint": false,
+      "dedup_key_formula": "SHA256('service:' + port_key + '|' + service_name.lower() + '|' + version)[:32]",
+      "dedup_key_example": "SHA256('service:{port_key}|nginx|1.24.0')[:32]",
+      "properties": ["port_key", "service_name", "product", "version", "cpe", "first_seen"]
+    },
+    {
+      "entity": "Vulnerability",
+      "identity_basis": "(FQDN, template_id, evidence_hash) tuple",
+      "canonical_property": null,
+      "unique_constraint": false,
+      "dedup_key_formula": "SHA256('vuln:' + fqdn.lower() + '|' + template_id + '|' + evidence_hash)[:32]",
+      "dedup_key_example": "SHA256('vuln:api.example.com|CVE-2023-XXXX|{evidence_hash}')[:32]",
+      "edge_cases": [
+        "Same template + different evidence = TWO distinct Vulnerability nodes",
+        "Transient findings: do NOT delete if not re-confirmed; mark last_confirmed unchanged; analyst decides archival"
+      ],
+      "properties": ["fqdn", "template_id", "severity", "severity_int", "cvss", "finding_class", "evidence_hash", "confirmed_at", "last_confirmed"]
+    }
+  ],
+
+  "relationship_model": [
+    {"type": "IS_SUBDOMAIN_OF", "from": "Subdomain", "to": "Domain", "key_formula": "SHA256(subdomain_key + '→PARENT→' + domain_key)[:32]", "directional": true},
+    {"type": "RESOLVES_TO", "from": "Subdomain", "to": "IPAddress", "key_formula": "SHA256(subdomain_key + '→DNS→' + ip_key + batch_id)[:32]", "directional": true, "note": "batch_id enables temporal tracking"},
+    {"type": "HOSTS", "from": "IPAddress", "to": "Port", "key_formula": "SHA256(ip_key + '→PORT→' + port_key)[:32]", "directional": true},
+    {"type": "RUNS", "from": "Port", "to": "Service", "key_formula": "SHA256(port_key + '→SVC→' + service_key)[:32]", "directional": true},
+    {"type": "RESPONDS_WITH", "from": "Subdomain", "to": "HTTPEndpoint", "key_formula": "SHA256(subdomain_key + '→HTTP→' + endpoint_key)[:32]", "directional": true},
+    {"type": "HAS_VULNERABILITY", "from": "Subdomain", "to": "Vulnerability", "key_formula": "SHA256(subdomain_key + '→VULN→' + vuln_key)[:32]", "directional": true},
+    {"type": "LINKS_TO", "from": "Subdomain", "to": "Subdomain", "key_formula": "SHA256(source_key + '→LINK→' + target_key)[:32]", "directional": true, "source": "katana crawl"},
+    {"type": "SAN_PEER", "from": "Subdomain", "to": "Subdomain", "key_formula": "SHA256(MIN(a_key, b_key) + '→SAN→' + MAX(a_key, b_key))[:32]", "directional": false, "source": "TLS SAN co-occurrence"},
+    {"type": "CNAME_TO", "from": "Subdomain", "to": "Subdomain", "key_formula": "SHA256(alias_key + '→CNAME→' + target_key)[:32]", "directional": true, "source": "DNS CNAME chain"}
+  ],
+
+  "wildcard_detection": {
+    "algorithm": "5 synthetic UUID probes per root domain before dispatch",
+    "detection_condition": "All 5 probes resolve to same A record set",
+    "action": "Set domain.wildcard=true; filter matching FQDNs from ingest queue",
+    "execution_timing": "At corpus load; re-run on unexpected_resolution_rate_spike ORS signal"
+  },
+
+  "reconciliation_strategy": {
+    "cadence": "per AWSEM chunk completion",
+    "settle_delay_sec": 30,
+    "extended_settle_sec": 60,
+    "extended_settle_trigger": "clickhouse_parts_per_table > 300",
+    "mismatch_threshold_pct": 0.5,
+    "query_pattern": "ClickHouse FINAL count vs Neo4j node count for batch_id set",
+    "on_mismatch": "ALERT ORS + Mattermost #ops-critical + halt next batch dispatch"
+  },
+
+  "validation_suite": [
+    {"test": "T1", "name": "Dedup Key Uniqueness", "method": "Generate 100k FQDNs; compute keys; assert zero SHA256 collisions"},
+    {"test": "T2", "name": "Cross-Entity Prefix Isolation", "method": "Same string across entity types; assert keys differ"},
+    {"test": "T3", "name": "Replay Idempotency", "method": "Ingest same 10k records twice; assert Neo4j + ClickHouse counts unchanged"},
+    {"test": "T4", "name": "CNAME Alias Isolation", "method": "Ingest alias + target; assert two distinct nodes + one CNAME_TO relationship"},
+    {"test": "T5", "name": "Wildcard Suppression", "method": "Wildcard domain + 1k synthetic FQDNs; assert zero nodes ingested"},
+    {"test": "T6", "name": "Link Precision", "method": "1k known (subdomain, IP) pairs; assert >= 99% RESOLVES_TO links present; zero false links"},
+    {"test": "T7", "name": "Reconciliation Accuracy", "method": "10k records; 30s settle; assert Neo4j within +/-0.5% of ClickHouse FINAL count"}
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "Wildcard inflation before detection", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "Wildcard detection at corpus load; ORS monitors unexpected_resolution_rate_spike"},
+    {"id": "R2", "title": "Dynamic body_hash causing false dedup misses", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Flag dynamic_content on first hash change; never update body_hash for dynamic endpoints"},
+    {"id": "R3", "title": "Multi-level eTLD extraction failures", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Use PSL library; unit test against known multi-level eTLDs"},
+    {"id": "R4", "title": "RESOLVES_TO relationship explosion (high-rotation IPs)", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Implement archival flag for RESOLVES_TO relationships stale > 90 days; not deletion"},
+    {"id": "R5", "title": "Reconciliation false positive from ClickHouse merge lag", "severity": "LOW", "probability": "MEDIUM", "mitigation": "30s settle delay; extend to 60s if clickhouse_parts_per_table > 300"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Implement wildcard DNS detection as corpus pre-processing step before first scan dispatch"},
+    {"priority": 2, "id": "REC-02", "action": "Use public suffix list (PSL) library for eTLD+1 extraction — no custom split logic"},
+    {"priority": 3, "id": "REC-03", "action": "Store dedup key as key_hash property on every Neo4j node for fast lookup and audit"},
+    {"priority": 4, "id": "REC-04", "action": "Run all 7 validation suite tests before first production write"},
+    {"priority": 5, "id": "REC-05", "action": "Implement SAN_PEER relationship from TLS certificate SAN fields"},
+    {"priority": 6, "id": "REC-06", "action": "Set reconciliation cadence to per-batch (not per-record or per-hour)"},
+    {"priority": 7, "id": "REC-07", "action": "Flag dynamic_content=true on HTTPEndpoints where body_hash changes between consecutive probes"},
+    {"priority": 8, "id": "REC-08", "action": "Implement CNAME_TO relationship from DNS CNAME chain records in dnsx output"}
+  ],
+
+  "metrics": {
+    "entity_types_defined": 7,
+    "relationship_types_defined": 9,
+    "dedup_key_length_hex_chars": 32,
+    "dedup_key_algorithm": "SHA256",
+    "duplicate_entity_rate_target_max_pct": 0.5,
+    "link_precision_target_min_pct": 99.0,
+    "reconciliation_runtime_max_min": 20,
+    "wildcard_probe_count_per_domain": 5,
+    "reconciliation_mismatch_threshold_pct": 0.5,
+    "validation_tests": 7
+  },
+
+  "confidence": 0.93,
+
+  "assumptions": [
+    "A1: eTLD+1 extraction uses Mozilla Public Suffix List; PSL library available as dependency",
+    "A2: dnsx output includes full CNAME chain for CNAME_TO relationship construction",
+    "A3: ClickHouse tables use ReplacingMergeTree(version) where version = Unix timestamp",
+    "A4: 30s settle delay sufficient for ClickHouse background merge on batches <= 100k rows",
+    "A5: Wildcard detection cost: 5 DNS queries per domain x domain count in corpus",
+    "A6: SHA256 prefix-tagged keys at 32 hex chars provide sufficient uniqueness for 10M+ entities (collision probability << 1 in 10^30)"
+  ]
+}
