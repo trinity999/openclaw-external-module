@@ -1,0 +1,300 @@
+{
+  "work_order": "WO-00008",
+  "category": "architecture",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.91,
+
+  "key_findings": [
+    "End-to-end platform is a 7-layer architecture: Corpus Manager → Oracle Execution → Parser → Ingest → Scoring → Analyst API → ORS/AWSEM meta-layer",
+    "Dual-store authority model is the core design invariant: Neo4j holds canonical entity graph (relationships, KRIL scores, findings); ClickHouse holds telemetry and aggregate analytics — neither store can substitute the other",
+    "Checkpoint-first write order (checkpoint → Neo4j → ClickHouse) is enforced by code assertion — not documentation — and enables full corpus replay with ≤ 0.5% data loss",
+    "Three phases (≤2 weeks each) deliver usable value incrementally: Phase 1 = DNS corpus processable; Phase 2 = HTTP positives + enriched findings; Phase 3 = analyst API + reporting",
+    "AWSEM dispatch-level concurrency caps are non-negotiable — advisory caps allow burst overcommit that causes Oracle CPU spikes and DLQ cascades",
+    "Phase gate automation in AWSEM (HTTP blocked until Phase 1 ORS green, Enrich blocked until HTTP positive gate) is required for 72h unattended operation",
+    "Bloom filter (Redis, 10M insertions, 0.01% FPR) provides O(1) pre-write dedup check — critical at 10M+ scale where query-per-write creates unacceptable throughput overhead",
+    "REST API backed by Neo4j (graph queries) + ClickHouse (aggregate stats) — materialized views prevent query latency regression as corpus grows to 10M+ records",
+    "What must be built net-new: HTTP/nuclei/katana parsers, KRIL scoring module, risk/value scoring, REST API (5 endpoints), Mattermost reporting, ClickHouse materialized views",
+    "What can be deferred to v1.1: additional Oracle workers, frontend dashboard, full Cypher graph analytics — REST API + Mattermost sufficient for v1 intelligence consumption"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Dual-store authority model: Neo4j + ClickHouse",
+      "summary": "Neo4j = canonical entity graph (relationships, KRIL, findings); ClickHouse = telemetry and aggregate analytics",
+      "rationale": "Neo4j excels at graph traversal and entity linking; ClickHouse excels at time-series aggregation. Forcing either store into the other's workload creates performance and schema complexity without benefit.",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D2",
+      "title": "Neo4j-first write order with checkpoint assertion",
+      "summary": "Write order: checkpoint(PENDING) → neo4j_write → clickhouse_write → checkpoint(COMPLETED). Enforced by code assertion, not documentation.",
+      "rationale": "Neo4j is the canonical entity store. ClickHouse records without Neo4j entity are orphaned telemetry. Checkpoint-first enables safe replay at exactly the failed record.",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D3",
+      "title": "AWSEM dispatch-level concurrency caps",
+      "summary": "Concurrency caps enforced at task dispatch, not as advisory limits. AWSEM will not dispatch beyond cap regardless of queue depth.",
+      "rationale": "Advisory caps allow burst overcommit under backpressure. Dispatch-level enforcement prevents Oracle CPU spikes that cascade into DLQ failures across all lanes.",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D4",
+      "title": "Three phased delivery (≤2 weeks each)",
+      "summary": "Phase 1: DNS ingest core. Phase 2: HTTP + Enrichment + Scoring. Phase 3: Analyst API + Reporting.",
+      "rationale": "Staged delivery allows early production use of DNS data while HTTP and API layers are built. Reduces rework risk by validating foundation before adding complexity.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Bloom filter for pre-write dedup at O(1)",
+      "summary": "Redis Bloom filter (10M insertions, 0.01% FPR) checked before every write. Single-record Neo4j lookup per write is O(N) and unacceptable at 10M+ scale.",
+      "rationale": "10M FQDN corpus × query-per-write = 10M Neo4j queries. Bloom filter reduces this to 10M O(1) lookups with 0.01% false positive rate (1,000 unnecessary dedup checks per 10M — acceptable).",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D6",
+      "title": "Phase gate automation in AWSEM",
+      "summary": "HTTP queue activation requires ORS Phase 1 gate confirmation. Enrich queue requires HTTP positive gate. Automated gate prevents manual timing errors during 72h unattended operation.",
+      "rationale": "Manual gate activation during 72h operation is error-prone. Automating gate passage via ORS signal eliminates the class of 'activated HTTP too early' or 'never activated Enrich' failures.",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D7",
+      "title": "REST API backed by Neo4j + ClickHouse with materialized views",
+      "summary": "Graph queries → Neo4j Cypher; aggregate stats → ClickHouse materialized views. Depth limit: max 3 hops on graph traversal.",
+      "rationale": "Materialized views prevent aggregate query latency regression as ClickHouse table grows to 10M+ rows. Graph depth limit prevents full-graph traversal from degrading API response time.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D8",
+      "title": "Frontend dashboard deferred to v1.1",
+      "summary": "REST API + Mattermost reporting sufficient for analyst consumption in v1. Frontend complexity deferred.",
+      "rationale": "Building a frontend in Phase 3 alongside API completion creates scope risk. Mattermost + REST API delivers sufficient intelligence access for Day-1 operations.",
+      "stability_impact": "neutral"
+    }
+  ],
+
+  "system_layers": [
+    {
+      "layer": 1,
+      "name": "Corpus Manager (AWSEM Scheduler)",
+      "component": "AWSEM",
+      "node": "controller",
+      "responsibilities": ["Partition FQDN corpus into chunks", "Dispatch tasks to scan queues", "Enforce phase gate logic", "Manage DLQ lifecycle"],
+      "critical_contracts": ["Chunk ID = SHA256(source_hash + chunk_offset)[:16]", "Phase gate: HTTP blocked until ORS Phase 1 green", "Concurrency caps enforced at dispatch level"]
+    },
+    {
+      "layer": 2,
+      "name": "Scan Execution (Oracle)",
+      "component": "Oracle scan tools",
+      "node": "oracle",
+      "responsibilities": ["Run dnsx, httpx, nuclei, katana", "Write output to temp dir atomically", "Send heartbeat every 30s", "Clean work dir after transfer"],
+      "critical_contracts": [
+        "DNS: 250 concurrent (Phase 1), 200 (Phase 3 steady state), timeout 30s",
+        "HTTP: 75 concurrent, timeout 30s",
+        "Enrich: 10→25 (ramp), timeout nuclei 5min katana 2min",
+        "Temp write: /tmp/oracle-work/{batch_id}/{lane}/{chunk_id}.json → atomic move"
+      ]
+    },
+    {
+      "layer": 3,
+      "name": "Parser (Controller)",
+      "component": "parser_module",
+      "node": "controller",
+      "responsibilities": ["Schema validate tool outputs", "Normalize FQDNs and timestamps", "Compute dedup keys", "Quarantine malformed records"],
+      "critical_contracts": [
+        "dnsx_parser_v1: dedup_key = SHA256(fqdn + 'dns')[:32]",
+        "httpx_parser_v1: dedup_key = SHA256(fqdn + url + status_code)[:32]",
+        "nuclei_parser_v1: dedup_key = SHA256(fqdn + template_id + evidence_hash)[:32]",
+        "Malformed → quarantine({batch_id, reason}); emit DLQ signal"
+      ]
+    },
+    {
+      "layer": 4,
+      "name": "Ingest (Controller)",
+      "component": "ingest_module",
+      "node": "controller",
+      "responsibilities": ["Checkpoint-first write order", "Bloom filter dedup", "Neo4j MERGE (canonical)", "ClickHouse INSERT (telemetry)"],
+      "critical_contracts": [
+        "Write order: bloom_check → checkpoint(PENDING) → neo4j_write → clickhouse_write → checkpoint(COMPLETED)",
+        "Neo4j batch: ≤500 ops/tx, timeout 60s",
+        "ClickHouse: ReplacingMergeTree(version), all reconciliation queries with FINAL",
+        "On any step fail: retry → DLQ; never skip checkpoint"
+      ]
+    },
+    {
+      "layer": 5,
+      "name": "Scoring (Controller)",
+      "component": "scoring_module",
+      "node": "controller",
+      "responsibilities": ["KRIL score computation (0-100)", "Risk/value score computation", "Write-back to Neo4j after each scan cycle"],
+      "critical_contracts": [
+        "KRIL: 5-signal composite (http_positive 30%, finding_density 25%, status_interesting 20%, recency 15%, link_complexity 10%)",
+        "KRIL batch: 50 targets per T2 call (WO-00004 routing policy)",
+        "Write-back: MATCH (n:Subdomain {name: $fqdn}) SET n.kril_score = $score"
+      ]
+    },
+    {
+      "layer": 6,
+      "name": "Analyst API (Controller)",
+      "component": "api_module",
+      "node": "controller",
+      "responsibilities": ["REST API (5 endpoints)", "Mattermost reporting (4 report types)", "Graph neighbor traversal"],
+      "critical_contracts": [
+        "API latency SLO: p99 ≤ 2s",
+        "Graph traversal: max depth 3 hops enforced",
+        "Aggregate queries: ClickHouse materialized views",
+        "Graph queries: Neo4j Cypher"
+      ]
+    },
+    {
+      "layer": 7,
+      "name": "ORS + AWSEM (Meta-layer)",
+      "component": "ors_awsem",
+      "node": "controller",
+      "responsibilities": ["15-signal monitoring", "Autonomous reflex execution", "Phase gate confirmation", "Heartbeat self-monitoring"],
+      "critical_contracts": [
+        "ORS heartbeat: external watchdog; alert if absent > 60s",
+        "All thresholds in ors_config.json (not hardcoded)",
+        "Static fallback table in AWSEM if ORS fails",
+        "Alert dedup: 10-minute window per signal; suppression 30 min after reflex"
+      ]
+    }
+  ],
+
+  "phase_milestones": [
+    {
+      "phase": 1,
+      "name": "Core Ingest Pipeline",
+      "weeks": "1-2",
+      "scope": ["DNS lane operational", "Parser + checkpoint + Neo4j + ClickHouse ingest", "ORS 8-signal monitoring", "Health API endpoint"],
+      "gate_criteria": {
+        "dns_error_rate_max": 0.02,
+        "neo4j_write_latency_p95_ms_max": 500,
+        "checkpoint_integrity_test": "pass",
+        "neo4j_nodes_min": 10000
+      },
+      "deliverable": "10M DNS corpus processable; entities in Neo4j and ClickHouse"
+    },
+    {
+      "phase": 2,
+      "name": "HTTP + Enrichment + Scoring",
+      "weeks": "3-4",
+      "scope": ["HTTP lane operational", "Enrichment lane operational", "KRIL scoring loop", "Full ORS 15-signal", "Phase gate automation"],
+      "gate_criteria": {
+        "http_error_rate_first_2k_max": 0.10,
+        "dns_http_link_rate_min": 0.95,
+        "http_positives_for_enrich_min": 10000,
+        "kril_scores_computed_for_http_positives": true
+      },
+      "deliverable": "HTTP positives identified and scored; findings enriched and ranked by KRIL"
+    },
+    {
+      "phase": 3,
+      "name": "Analyst API + Reporting",
+      "weeks": "5-6",
+      "scope": ["Full REST API (5 endpoints)", "Mattermost reporting (4 types)", "ClickHouse materialized views", "Graph neighbor API", "TLS SAN expansion"],
+      "gate_criteria": {
+        "api_latency_p99_ms_max": 2000,
+        "mattermost_report_delivered_consecutive_hours": 3,
+        "graph_neighbor_depth2_latency_p95_ms_max": 2000
+      },
+      "deliverable": "Production analyst platform; intelligence consumable without raw data access"
+    }
+  ],
+
+  "ingest_latency_slos": [
+    {"stage": "DNS scan to parser output", "metric": "dns_parse_latency_p95_ms", "target_ms": 200, "warning_ms": 200, "critical_ms": 500},
+    {"stage": "Parser output to Neo4j committed", "metric": "neo4j_write_latency_p95_ms", "target_ms": 500, "warning_ms": 400, "critical_ms": 500},
+    {"stage": "Parser output to ClickHouse committed", "metric": "ch_insert_latency_p95_ms", "target_ms": 300, "warning_ms": 300, "critical_ms": 1000},
+    {"stage": "HTTP scan to parser output", "metric": "http_parse_latency_p95_ms", "target_ms": 500, "warning_ms": 500, "critical_ms": 1500},
+    {"stage": "Enrichment finding to ingest complete", "metric": "enrich_ingest_latency_p95_ms", "target_ms": 5000, "warning_ms": 5000, "critical_ms": 10000},
+    {"stage": "KRIL score to Neo4j write-back", "metric": "kril_writeback_latency_p95_ms", "target_ms": 500, "warning_ms": 500, "critical_ms": 1000},
+    {"stage": "API query response", "metric": "api_response_p99_ms", "target_ms": 2000, "warning_ms": 1500, "critical_ms": 2000},
+    {"stage": "End-to-end scan to queryable", "metric": "e2e_ingest_latency_p95_min", "target_min": 5, "warning_min": 5, "critical_min": 15}
+  ],
+
+  "api_endpoints": [
+    {"method": "GET", "path": "/api/v1/subdomains", "query_backend": "neo4j", "filters": ["resolved", "http_positive", "has_findings"], "sort": ["kril_score", "asset_risk_score", "first_seen"]},
+    {"method": "GET", "path": "/api/v1/subdomains/{fqdn}", "query_backend": "neo4j", "returns": ["subdomain", "ip_addresses", "http_responses", "findings", "kril_score"]},
+    {"method": "GET", "path": "/api/v1/findings", "query_backend": "neo4j+clickhouse", "filters": ["severity", "template_id"], "sort": ["discovered_at"]},
+    {"method": "GET", "path": "/api/v1/graph/neighbors", "query_backend": "neo4j_cypher", "max_depth": 3, "relationships": ["LINKS_TO", "SAN_PEER"]},
+    {"method": "GET", "path": "/api/v1/stats/summary", "query_backend": "clickhouse_materialized_view", "fields": ["corpus_total", "dns_completed_pct", "http_completed_pct", "findings_total", "critical_findings", "slo_status", "phase_current"]}
+  ],
+
+  "neo4j_schema": {
+    "nodes": [
+      {"label": "Subdomain", "key_property": "name", "unique_constraint": true, "properties": ["name", "key_hash", "a_records", "first_seen", "last_seen", "resolved", "kril_score", "asset_risk_score", "ingested_batch_id"]},
+      {"label": "IPAddress", "key_property": "addr", "unique_constraint": true, "properties": ["addr", "ptr", "asn", "country", "org", "first_seen", "last_seen"]},
+      {"label": "Service", "key_property": null, "unique_constraint": false, "properties": ["port", "protocol", "banner", "product", "version"]},
+      {"label": "HTTPResponse", "key_property": null, "unique_constraint": false, "properties": ["url", "status_code", "content_type", "title", "body_hash", "first_seen"]},
+      {"label": "Finding", "key_property": "template_id", "unique_constraint": false, "properties": ["template_id", "severity", "severity_int", "cvss", "finding_class", "confirmed_at"]},
+      {"label": "Domain", "key_property": "name", "unique_constraint": true, "properties": ["name", "tld", "registrar", "expires_at"]}
+    ],
+    "relationships": [
+      {"type": "RESOLVES_TO", "from": "Subdomain", "to": "IPAddress"},
+      {"type": "IS_SUBDOMAIN_OF", "from": "Subdomain", "to": "Domain"},
+      {"type": "HOSTS", "from": "IPAddress", "to": "Service"},
+      {"type": "RESPONDS_WITH", "from": "Subdomain", "to": "HTTPResponse"},
+      {"type": "HAS_FINDING", "from": "Subdomain", "to": "Finding"},
+      {"type": "LINKS_TO", "from": "Subdomain", "to": "Subdomain"},
+      {"type": "SAN_PEER", "from": "Subdomain", "to": "Subdomain"}
+    ]
+  },
+
+  "reuse_vs_build": {
+    "reuse_existing": ["AWSEM queue infrastructure", "ORS signal framework", "Checkpoint store (Redis/SQLite)", "Bloom filter (Redis)", "Neo4j connection pool", "ClickHouse connection"],
+    "build_net_new": ["httpx parser", "nuclei parser", "katana parser", "KRIL scoring module", "Risk/value scoring logic", "REST API (5 endpoints)", "Mattermost reporting module", "ClickHouse materialized views"],
+    "defer_to_v1_1": ["Multi-worker Oracle", "Frontend dashboard", "Full Cypher graph analytics"]
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "Neo4j degrades at 10M+ node scale", "severity": "HIGH", "probability": "LOW", "mitigation": "Heap+page cache pre-configured; MERGE batch ≤ 500 ops; no full-graph scans during ingest"},
+    {"id": "R2", "title": "ClickHouse background merge falls behind", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "ORS monitors clickhouse_parts_per_table; OPTIMIZE TABLE on WARNING"},
+    {"id": "R3", "title": "API query performance degrades under load", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Materialized views for aggregate queries; depth limit on graph traversal"},
+    {"id": "R4", "title": "Enrichment DLQ accumulation", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Per-lane DLQ TTL; ORS alert at 500 items; Enrich concurrency auto-reduced on Oracle memory pressure"},
+    {"id": "R5", "title": "Phase gate failure delays multi-lane activation", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Gate metrics are measurable and observable; Phase 1 window builds confidence before commit"},
+    {"id": "R6", "title": "Scoring batch bottleneck", "severity": "LOW", "probability": "LOW", "mitigation": "KRIL scoring runs after scan cycle; does not block ingest throughput"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Build DNS ingest path end-to-end (Phase 1) before adding HTTP — validates foundation before complexity"},
+    {"priority": 2, "id": "REC-02", "action": "Apply Neo4j schema constraints and verify before first production write"},
+    {"priority": 3, "id": "REC-03", "action": "Implement phase gate automation in AWSEM before Phase 2 — manual gate timing is error-prone at 72h"},
+    {"priority": 4, "id": "REC-04", "action": "Add ORS 15-signal monitoring before Phase 2 start — enrichment + scoring add complexity"},
+    {"priority": 5, "id": "REC-05", "action": "Implement /api/v1/stats/summary in Phase 1 — gives immediate operational visibility"},
+    {"priority": 6, "id": "REC-06", "action": "Use ClickHouse materialized views for all aggregate API queries"},
+    {"priority": 7, "id": "REC-07", "action": "Defer frontend dashboard to v1.1; REST API + Mattermost sufficient for v1"},
+    {"priority": 8, "id": "REC-08", "action": "Run 1h dry-run for each phase before committing to 72h operation window"}
+  ],
+
+  "metrics": {
+    "system_layers": 7,
+    "delivery_phases": 3,
+    "weeks_per_phase_max": 2,
+    "total_delivery_weeks": 6,
+    "neo4j_node_types": 6,
+    "neo4j_relationship_types": 7,
+    "clickhouse_tables": 3,
+    "api_endpoints": 5,
+    "mattermost_report_types": 4,
+    "ingest_latency_slos_defined": 8,
+    "data_loss_under_replay_max_pct": 0.5,
+    "api_latency_p99_ms_max": 2000,
+    "throughput_increase_vs_baseline_min_pct": 30
+  },
+
+  "assumptions": [
+    "A1: Oracle has >= 32 CPU cores, >= 64GB RAM; Controller has >= 16GB RAM (32GB recommended)",
+    "A2: Redis, Neo4j, ClickHouse deployable on Controller or Oracle based on RAM constraints",
+    "A3: AWSEM supports concurrency cap enforcement at dispatch level",
+    "A4: ORS reads real-time signals from Neo4j, ClickHouse, and Redis",
+    "A5: Mattermost webhook URL available for reporting integration",
+    "A6: dnsx, httpx, nuclei, katana tools available on Oracle with version pinning",
+    "A7: REST API requires no auth for v1 (internal network only); auth deferred to v1.1",
+    "A8: ClickHouse materialized views sufficient for analyst dashboard queries without additional BI layer"
+  ]
+}
