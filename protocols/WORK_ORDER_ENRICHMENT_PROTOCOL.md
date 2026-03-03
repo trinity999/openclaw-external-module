@@ -1,4 +1,4 @@
-# OPENCLAW WORK ORDER ENRICHMENT PROTOCOL (WOEP)
+# RUDRA WORK ORDER ENRICHMENT PROTOCOL (WOEP)
 
 ## Principle
 External analysts should never need to guess system intent.
