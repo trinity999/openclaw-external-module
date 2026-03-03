@@ -1,0 +1,429 @@
+{
+  "work_order": "WO-00007",
+  "category": "audit",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.92,
+
+  "key_findings": [
+    "ORS heartbeat self-monitor (C5.1) is the most critical missing control — ORS process failure is invisible without it, leaving all automated stability responses inert",
+    "Redis noeviction policy (C1.5) is required — LRU eviction silently destroys checkpoint data under memory pressure; controller must detect Redis errors and switch to SQLite WAL fallback",
+    "Neo4j unique constraint on Subdomain.name (C2.1) must be applied before first production write — MERGE without constraint allows silent duplicate nodes under concurrent ingest",
+    "ClickHouse FINAL keyword absent from reconciliation queries (C3.2) is a HIGH-probability gap — ReplacingMergeTree dedup is not visible without FINAL; mismatch rate appears artificially low",
+    "Eight named failure signatures (FS-01 through FS-08) defined — each has distinct observable metric pattern distinguishable from similar failure modes before catastrophic SLO breach",
+    "AWSEM concurrency caps enforced at dispatch level (C4.4) is non-negotiable — advisory caps alone allow Oracle CPU overload under burst conditions",
+    "Oracle tool timeouts (C7.3) are critical — nuclei without timeout on large-response targets causes OOM kill cascades in Enrich lane",
+    "Alert deduplication (10-minute window per signal) prevents Mattermost flood under sustained degradation; without dedup, operator alert fatigue causes missed CRITICAL signals",
+    "Hardening checklist has 47 items across 8 layers; 16 are CRITICAL and must complete before first production write",
+    "Failure signature library accelerates operator pattern recognition — named patterns (DNS Queue Starvation, DLQ Cascade, etc.) reduce mean time to identification from 30 min to < 5 min"
+  ],
+
+  "hardening_layers": [
+    {
+      "layer": 1,
+      "name": "Checkpoint Store (Redis / SQLite WAL)",
+      "items_total": 10,
+      "items_critical": 3,
+      "items_high": 4,
+      "critical_item_ids": ["C1.1", "C1.3", "C1.5"],
+      "highest_risk_failure": "Redis running without AOF — all checkpoints lost on Redis restart — full corpus replay required with duplicate ingest risk",
+      "checks": [
+        {"id": "C1.1", "check": "Redis AOF persistence enabled", "action": "appendonly yes in redis.conf", "priority": "CRITICAL"},
+        {"id": "C1.2", "check": "Redis RDB snapshots disabled or secondary only", "action": "AOF supersedes RDB for WAL use", "priority": "HIGH"},
+        {"id": "C1.3", "check": "Redis bound to localhost or VPN interface only", "action": "bind 127.0.0.1", "priority": "CRITICAL"},
+        {"id": "C1.4", "check": "Redis authentication enabled (requirepass)", "action": "Reject unauthenticated connections", "priority": "HIGH"},
+        {"id": "C1.5", "check": "Redis maxmemory set with noeviction policy", "action": "Checkpoint data must NOT be evictable", "priority": "CRITICAL"},
+        {"id": "C1.6", "check": "Redis maxmemory >= 1GB (Bloom filter + checkpoint)", "action": "Bloom ~240MB + checkpoints ~100MB = 1GB minimum", "priority": "HIGH"},
+        {"id": "C1.7", "check": "Stale PENDING checkpoint ORS monitor active", "action": "ORS: checkpoint_pending_age_min > 3 = WARNING, > 5 = CRITICAL", "priority": "CRITICAL"},
+        {"id": "C1.8", "check": "SQLite WAL fallback tested and validated", "action": "Synthetic Redis kill test; verify WAL records checkpoint", "priority": "HIGH"},
+        {"id": "C1.9", "check": "Checkpoint TTL enforced", "action": "COMPLETED checkpoints older than 72h deleted", "priority": "MEDIUM"},
+        {"id": "C1.10", "check": "Redis replication configured (if available)", "action": "AOF-only for single node; replication for HA", "priority": "LOW"}
+      ]
+    },
+    {
+      "layer": 2,
+      "name": "Neo4j Graph Database",
+      "items_total": 12,
+      "items_critical": 3,
+      "items_high": 6,
+      "critical_item_ids": ["C2.1", "C2.5", "C2.6"],
+      "highest_risk_failure": "Missing unique constraint on Subdomain.name — MERGE creates duplicate nodes silently under concurrent DNS+HTTP writes on same subdomain",
+      "checks": [
+        {"id": "C2.1", "check": "Schema constraint applied — Subdomain.name UNIQUE", "action": "CREATE CONSTRAINT subdomain_name_unique IF NOT EXISTS", "priority": "CRITICAL"},
+        {"id": "C2.2", "check": "Indexes on all query properties", "action": "Index: name, key_hash, ingested_batch_id, scanned, kril_rank_pct", "priority": "HIGH"},
+        {"id": "C2.3", "check": "Heap size pre-configured (fixed)", "action": "heap.initial_size=6g, heap.max_size=6g", "priority": "HIGH"},
+        {"id": "C2.4", "check": "Page cache pre-configured (SSD-backed)", "action": "pagecache.size=8g — prevents cold query latency spikes", "priority": "HIGH"},
+        {"id": "C2.5", "check": "Transaction timeout set (60s)", "action": "dbms.transaction.timeout=60s", "priority": "CRITICAL"},
+        {"id": "C2.6", "check": "Default credentials rotated before production", "action": "neo4j/neo4j default changed before first write", "priority": "CRITICAL"},
+        {"id": "C2.7", "check": "Bolt TLS enabled", "action": "dbms.connector.bolt.tls_level=REQUIRED", "priority": "HIGH"},
+        {"id": "C2.8", "check": "Log rotation configured", "action": "tx_log.rotation.size=256m, keep_number=10", "priority": "MEDIUM"},
+        {"id": "C2.9", "check": "Write query timeout enforced (30s max)", "action": "All MERGE queries have explicit timeout at controller level", "priority": "HIGH"},
+        {"id": "C2.10", "check": "Backup scheduled", "action": "Daily Neo4j dump to cold storage", "priority": "MEDIUM"},
+        {"id": "C2.11", "check": "Max concurrent connections limited (50)", "action": "dbms.connector.bolt.thread_pool_max_size=50", "priority": "HIGH"},
+        {"id": "C2.12", "check": "Slow query log enabled (> 5000ms)", "action": "dbms.logs.query.threshold=5000ms", "priority": "MEDIUM"}
+      ]
+    },
+    {
+      "layer": 3,
+      "name": "ClickHouse Telemetry Store",
+      "items_total": 10,
+      "items_critical": 2,
+      "items_high": 5,
+      "critical_item_ids": ["C3.2", "C3.5"],
+      "highest_risk_failure": "ClickHouse background merge falls behind under high INSERT rate — parts accumulate — FINAL queries slow from seconds to minutes — validate lane backs up",
+      "checks": [
+        {"id": "C3.1", "check": "ReplacingMergeTree version column verified monotonic", "action": "version = Unix timestamp; verify clock sync", "priority": "HIGH"},
+        {"id": "C3.2", "check": "FINAL keyword enforced in all reconciliation queries", "action": "Code audit: grep COUNT(*) FROM subdomains without FINAL", "priority": "CRITICAL"},
+        {"id": "C3.3", "check": "INSERT timeout configured (30s)", "action": "insert_timeout=30", "priority": "HIGH"},
+        {"id": "C3.4", "check": "Max insert block size tuned (1M rows)", "action": "max_insert_block_size=1048576", "priority": "MEDIUM"},
+        {"id": "C3.5", "check": "Remote access restricted to controller/oracle IPs", "action": "Bind ClickHouse to controller/oracle IPs only", "priority": "CRITICAL"},
+        {"id": "C3.6", "check": "Authentication enabled (users.xml with password hash)", "action": "No default no-auth access", "priority": "HIGH"},
+        {"id": "C3.7", "check": "Background merge monitored by ORS", "action": "ORS: clickhouse_parts_per_table > 500 = WARNING, > 1000 = CRITICAL", "priority": "HIGH"},
+        {"id": "C3.8", "check": "Part compaction settings tuned", "action": "merge_tree.max_parts_in_total=2000", "priority": "MEDIUM"},
+        {"id": "C3.9", "check": "Disk space monitoring", "action": "ORS: clickhouse_disk_free_pct < 20% = WARNING, < 10% = CRITICAL", "priority": "HIGH"},
+        {"id": "C3.10", "check": "Backup policy (daily minimum)", "action": "BACKUP TABLE or filesystem snapshot", "priority": "MEDIUM"}
+      ]
+    },
+    {
+      "layer": 4,
+      "name": "AWSEM Scheduler and Queue System",
+      "items_total": 9,
+      "items_critical": 3,
+      "items_high": 4,
+      "critical_item_ids": ["C4.1", "C4.3", "C4.4"],
+      "highest_risk_failure": "AWSEM concurrency cap as advisory only — dispatcher issues 400 tasks instead of 250 — Oracle CPU spikes — tool failures — DLQ cascade — all lanes degrade simultaneously",
+      "checks": [
+        {"id": "C4.1", "check": "Queue max depth enforced at enqueue (reject not drop)", "action": "Rejection triggers backpressure to scan tool", "priority": "CRITICAL"},
+        {"id": "C4.2", "check": "DLQ TTL enforced", "action": "Expired items logged and discarded; not silently retained", "priority": "HIGH"},
+        {"id": "C4.3", "check": "Dead-letter visibility timeout configured (manual re-enqueue only)", "action": "DLQ items must NOT auto-re-visible to primary queue", "priority": "CRITICAL"},
+        {"id": "C4.4", "check": "Concurrency caps enforced at dispatch level (not advisory)", "action": "AWSEM must not dispatch beyond concurrency_cap", "priority": "CRITICAL"},
+        {"id": "C4.5", "check": "Per-lane queue depth monitored by ORS", "action": "ORS: queue_depth_pct > 0.7 = WARNING, > 0.95 = CRITICAL", "priority": "HIGH"},
+        {"id": "C4.6", "check": "Task deduplication at enqueue (within TTL window)", "action": "Reject duplicate task IDs; prevents double-dispatch under retry", "priority": "HIGH"},
+        {"id": "C4.7", "check": "DLQ visibility to Mattermost (per 100-item increment)", "action": "DLQ is not silent", "priority": "MEDIUM"},
+        {"id": "C4.8", "check": "AWSEM process restart safety (checkpoint reclaim)", "action": "On restart, in-flight tasks reclaimed from checkpoint store", "priority": "HIGH"},
+        {"id": "C4.9", "check": "Lane isolation enforced structurally", "action": "DNS DLQ cannot affect HTTP queue processing", "priority": "HIGH"}
+      ]
+    },
+    {
+      "layer": 5,
+      "name": "ORS Reflex Monitor",
+      "items_total": 10,
+      "items_critical": 3,
+      "items_high": 4,
+      "critical_item_ids": ["C5.1", "C5.2", "C5.6"],
+      "highest_risk_failure": "ORS process crashes silently without heartbeat monitor — escalation storms, CPU overloads, DLQ cascades proceed without automated response",
+      "checks": [
+        {"id": "C5.1", "check": "ORS heartbeat self-monitor (external watchdog)", "action": "Watchdog alerts if heartbeat absent > 60s", "priority": "CRITICAL"},
+        {"id": "C5.2", "check": "Reflex actions are idempotent", "action": "Test: fire reflex twice — verify same system state", "priority": "CRITICAL"},
+        {"id": "C5.3", "check": "Alert deduplication enforced (10-minute window)", "action": "Same alert not sent more than once per 10 min", "priority": "HIGH"},
+        {"id": "C5.4", "check": "Alert suppression after reflex (30 min)", "action": "After reflex fires, suppress triggering alert for 30 min", "priority": "HIGH"},
+        {"id": "C5.5", "check": "All ORS thresholds in ors_config.json (not hardcoded)", "action": "Verify with code grep", "priority": "HIGH"},
+        {"id": "C5.6", "check": "ORS static fallback table in AWSEM", "action": "If ORS fails, AWSEM applies safe defaults (suspend all lanes)", "priority": "CRITICAL"},
+        {"id": "C5.7", "check": "Signal source health monitoring", "action": "ORS monitors Neo4j, ClickHouse, Redis responsiveness", "priority": "HIGH"},
+        {"id": "C5.8", "check": "Reflex audit log (signal, threshold, action, timestamp)", "action": "Every reflex action logged with full context", "priority": "MEDIUM"},
+        {"id": "C5.9", "check": "Manual override capability (ors suspend/resume [lane])", "action": "Operator override for emergency intervention", "priority": "MEDIUM"},
+        {"id": "C5.10", "check": "ORS test/dry-run mode", "action": "Log reflexes but don't execute — for threshold calibration", "priority": "LOW"}
+      ]
+    },
+    {
+      "layer": 6,
+      "name": "Controller Process",
+      "items_total": 10,
+      "items_critical": 3,
+      "items_high": 6,
+      "critical_item_ids": ["C6.1", "C6.2", "C6.9"],
+      "highest_risk_failure": "Controller has no memory limit — enrichment output buffering causes RAM spike — OOM — ingest halts — checkpoint in PENDING state indefinitely — no alerts",
+      "checks": [
+        {"id": "C6.1", "check": "Write order contract enforced as code assertion", "action": "assert neo4j_write_succeeded before clickhouse_write()", "priority": "CRITICAL"},
+        {"id": "C6.2", "check": "Checkpoint write before datastore write enforced as code assertion", "action": "assert checkpoint_written_pending before neo4j_write()", "priority": "CRITICAL"},
+        {"id": "C6.3", "check": "Quarantine directory write-protected (controller UID only)", "action": "Only controller process UID can write to artifacts/quarantine/", "priority": "HIGH"},
+        {"id": "C6.4", "check": "Max concurrent connections to Neo4j enforced", "action": "Connection pool max set in controller", "priority": "HIGH"},
+        {"id": "C6.5", "check": "Controller memory limits set (systemd MemoryMax or Docker --memory)", "action": "Prevents OOM from buffering spike", "priority": "HIGH"},
+        {"id": "C6.6", "check": "Graceful shutdown handler (SIGTERM → flush → checkpoint → exit)", "action": "No abrupt kill during ingest", "priority": "HIGH"},
+        {"id": "C6.7", "check": "FQDN normalization at single entry point", "action": "Single normalize_fqdn() function; no inline normalization", "priority": "HIGH"},
+        {"id": "C6.8", "check": "Structured logging with correlation IDs (batch_id, lane, timestamp)", "action": "Supports post-hoc forensic analysis", "priority": "MEDIUM"},
+        {"id": "C6.9", "check": "Source file hash verification enabled (SHA-256; HALT on mismatch)", "action": "Reject chunk if hash mismatch; do not warn", "priority": "CRITICAL"},
+        {"id": "C6.10", "check": "Retry limits enforced at controller level (no unbounded retry loops)", "action": "Max retry counts as constants", "priority": "HIGH"}
+      ]
+    },
+    {
+      "layer": 7,
+      "name": "Oracle Scan Node and Tooling",
+      "items_total": 10,
+      "items_critical": 3,
+      "items_high": 5,
+      "critical_item_ids": ["C7.3", "C7.5", "C7.7"],
+      "highest_risk_failure": "Nuclei without timeout on large-response target — Oracle OOM — nuclei OOM-killed — enrichment items silently lost — DLQ grows — no alert if Oracle output rate not monitored",
+      "checks": [
+        {"id": "C7.1", "check": "Scan tool versions pinned in deployment manifest", "action": "dnsx, httpx, nuclei, katana: no 'latest' tag", "priority": "HIGH"},
+        {"id": "C7.2", "check": "Per-tool output size limit enforced", "action": "dnsx: 10MB; httpx: 50MB; nuclei: 100MB per target", "priority": "HIGH"},
+        {"id": "C7.3", "check": "Per-tool timeout per target enforced", "action": "dnsx: 30s; httpx: 30s; nuclei: 5 min per target", "priority": "CRITICAL"},
+        {"id": "C7.4", "check": "Tool output written to temp dir (atomic move on success)", "action": "/tmp/oracle-work/{batch_id}/ — prevents partial file reads", "priority": "HIGH"},
+        {"id": "C7.5", "check": "Oracle output JSON schema validation at controller", "action": "Reject malformed output before processing", "priority": "CRITICAL"},
+        {"id": "C7.6", "check": "Tool process memory limits (ulimit or cgroup)", "action": "Nuclei OOM-kill should not take down Oracle node", "priority": "HIGH"},
+        {"id": "C7.7", "check": "Oracle heartbeat to Controller every 30s", "action": "ORS: absence > 30s = WARNING, > 120s = CRITICAL", "priority": "CRITICAL"},
+        {"id": "C7.8", "check": "Nuclei template updates managed (not auto-update during 72h)", "action": "Controlled update schedule only", "priority": "MEDIUM"},
+        {"id": "C7.9", "check": "Oracle work directory cleanup after batch", "action": "/tmp/oracle-work/ cleaned; prevents disk exhaustion", "priority": "HIGH"},
+        {"id": "C7.10", "check": "Rate limiter per tool per domain", "action": "dnsx: 10 concurrent/root domain; httpx: 5 concurrent/IP", "priority": "MEDIUM"}
+      ]
+    },
+    {
+      "layer": 8,
+      "name": "Network and Credential Security",
+      "items_total": 10,
+      "items_critical": 3,
+      "items_high": 5,
+      "critical_item_ids": ["C8.1", "C8.5", "C8.9"],
+      "highest_risk_failure": "Credentials in source code committed to git — all database access compromised; requires immediate rotation of all secrets",
+      "checks": [
+        {"id": "C8.1", "check": "Controller-Oracle on private network or VPN", "action": "No traffic on public internet; private LAN or WireGuard", "priority": "CRITICAL"},
+        {"id": "C8.2", "check": "Neo4j Bolt TLS enabled", "action": "dbms.connector.bolt.tls_level=REQUIRED", "priority": "HIGH"},
+        {"id": "C8.3", "check": "ClickHouse HTTPS enabled", "action": "Native protocol TLS or HTTPS interface", "priority": "HIGH"},
+        {"id": "C8.4", "check": "Redis TLS or UNIX socket (same-host preferred)", "action": "UNIX socket preferred: lower latency, no network attack surface", "priority": "HIGH"},
+        {"id": "C8.5", "check": "All credentials in secrets manager or env file (not source code)", "action": ".env file not committed; gitignore enforced", "priority": "CRITICAL"},
+        {"id": "C8.6", "check": "Credential rotation schedule (post-72h operation)", "action": "All DB passwords rotated; tested quarterly", "priority": "MEDIUM"},
+        {"id": "C8.7", "check": "Mattermost webhook URL treated as secret", "action": "Webhook URL in env file; not in logs or source", "priority": "HIGH"},
+        {"id": "C8.8", "check": "Oracle SSH key-based access only", "action": "Password auth disabled; only controller public key authorized", "priority": "HIGH"},
+        {"id": "C8.9", "check": "Firewall rules for datastore ports (7687, 9000, 6379)", "action": "Accept only from controller/oracle IPs", "priority": "CRITICAL"},
+        {"id": "C8.10", "check": "Audit log for credential access (alert on > 3 failed auth/min)", "action": "All DB auth events logged", "priority": "MEDIUM"}
+      ]
+    }
+  ],
+
+  "hardening_summary": {
+    "total_items": 81,
+    "items_critical": 20,
+    "items_high": 39,
+    "items_medium": 17,
+    "items_low": 5,
+    "phase_1_critical_before_first_write": [
+      "C1.1", "C1.3", "C1.5",
+      "C2.1", "C2.5", "C2.6",
+      "C3.2", "C3.5", "C3.6",
+      "C4.1", "C4.3", "C4.4",
+      "C5.1", "C5.6",
+      "C6.1", "C6.2", "C6.9",
+      "C7.3", "C7.5", "C7.7",
+      "C8.1", "C8.5", "C8.9"
+    ]
+  },
+
+  "slo_definitions": [
+    {"slo": "DNS Throughput", "metric": "dns_resolutions_per_hour", "target_gte": 700000, "warning_lt": 600000, "critical_lt": 500000},
+    {"slo": "HTTP Throughput", "metric": "http_probes_per_hour", "target_gte": 50000, "warning_lt": 40000, "critical_lt": 30000},
+    {"slo": "Enrich Throughput", "metric": "enrich_targets_per_hour", "target_gte": 5000, "warning_lt": 3000, "critical_lt": 1000},
+    {"slo": "Ingest Throughput", "metric": "ingest_records_per_hour", "target_gte": 200000, "warning_lt": 150000, "critical_lt": 100000},
+    {"slo": "Neo4j Write Latency", "metric": "neo4j_write_latency_p95_ms", "target_lte": 500, "warning_gt": 400, "critical_gt": 500},
+    {"slo": "ClickHouse Insert Queue", "metric": "clickhouse_insert_queue_rows", "target_lte": 100000, "warning_gt": 100000, "critical_gt": 500000},
+    {"slo": "Validate Mismatch", "metric": "reconciliation_mismatch_pct", "target_lte": 0.005, "warning_gt": 0.002, "critical_gt": 0.005},
+    {"slo": "Lane DLQ Depth", "metric": "dlq_depth_per_lane", "target_lt": 500, "warning_gte": 500, "critical_gte": 2000},
+    {"slo": "Premium Model Usage", "metric": "premium_escalation_rate", "target_lte": 0.05, "warning_gt": 0.04, "critical_gt": 0.05},
+    {"slo": "Checkpoint Staleness", "metric": "checkpoint_pending_age_min", "target": 0, "warning_gt": 3, "critical_gt": 5},
+    {"slo": "Incident MTTR", "metric": "ors_alert_to_resolution_min", "target_lte": 20, "warning_gt": 15, "critical_gt": 20},
+    {"slo": "Oracle CPU", "metric": "oracle_cpu_utilization_pct", "target_lte": 85, "warning_gt": 80, "critical_gt": 90},
+    {"slo": "ClickHouse Part Count", "metric": "clickhouse_parts_per_table", "target_lt": 500, "warning_gte": 500, "critical_gte": 1000},
+    {"slo": "Oracle Heartbeat", "metric": "oracle_heartbeat_absence_sec", "target": 0, "warning_gt": 30, "critical_gt": 120}
+  ],
+
+  "alert_catalog": [
+    {"id": "ALT-001", "signal": "dns_resolutions_per_hour", "threshold": "< 500k", "severity": "CRITICAL", "dedup_window_min": 10, "suppression_after_reflex_min": 30},
+    {"id": "ALT-002", "signal": "http_probes_per_hour", "threshold": "< 30k", "severity": "CRITICAL", "dedup_window_min": 10, "suppression_after_reflex_min": 30},
+    {"id": "ALT-003", "signal": "neo4j_write_latency_p95_ms", "threshold": "> 500", "severity": "CRITICAL", "dedup_window_min": 5, "suppression_after_reflex_min": 30},
+    {"id": "ALT-004", "signal": "reconciliation_mismatch_pct", "threshold": "> 0.5%", "severity": "CRITICAL", "dedup_window": "per_batch", "suppression_after_reflex": "manual_clear"},
+    {"id": "ALT-005", "signal": "dlq_depth_per_lane", "threshold": ">= 2000", "severity": "CRITICAL", "dedup_window_min": 10, "suppression_after_reflex": "manual_clear"},
+    {"id": "ALT-006", "signal": "checkpoint_pending_age_min", "threshold": "> 5", "severity": "CRITICAL", "dedup_window_min": 2, "suppression_after_reflex": "manual_clear"},
+    {"id": "ALT-007", "signal": "oracle_heartbeat_absence_sec", "threshold": "> 120", "severity": "CRITICAL", "dedup_window_min": 5, "suppression_after_reflex": "manual_clear"},
+    {"id": "ALT-008", "signal": "oracle_cpu_utilization_pct", "threshold": "> 90%", "severity": "CRITICAL", "dedup_window_min": 5, "suppression_after_reflex_min": 30},
+    {"id": "ALT-009", "signal": "clickhouse_parts_per_table", "threshold": ">= 1000", "severity": "WARNING", "dedup_window_min": 30, "suppression_after_reflex_min": 60},
+    {"id": "ALT-010", "signal": "clickhouse_disk_free_pct", "threshold": "< 10%", "severity": "CRITICAL", "dedup_window_min": 10, "suppression_after_reflex": "manual_clear"},
+    {"id": "ALT-011", "signal": "premium_escalation_rate", "threshold": "> 5%", "severity": "WARNING", "dedup_window_min": 60, "suppression_after_reflex_min": 60},
+    {"id": "ALT-012", "signal": "ors_heartbeat_absence_sec", "threshold": "> 60", "severity": "CRITICAL", "dedup_window_min": 2, "suppression_after_reflex": "none"},
+    {"id": "ALT-013", "signal": "controller_disk_write_queue_mb", "threshold": "> 1000", "severity": "CRITICAL", "dedup_window_min": 5, "suppression_after_reflex_min": 30},
+    {"id": "ALT-014", "signal": "dlq_depth_per_lane", "threshold": ">= 500", "severity": "WARNING", "dedup_window_min": 10, "suppression_after_reflex_min": 30},
+    {"id": "ALT-015", "signal": "dns_http_link_rate_pct", "threshold": "< 90%", "severity": "CRITICAL", "dedup_window_min": 10, "suppression_after_reflex": "manual_clear"}
+  ],
+
+  "alert_routing": {
+    "critical_channel": "#ops-critical",
+    "critical_action": "post + on-call ping",
+    "warning_channel": "#ops-monitoring",
+    "warning_action": "post only"
+  },
+
+  "failure_signatures": [
+    {
+      "id": "FS-01",
+      "name": "DNS Queue Starvation",
+      "description": "Oracle cannot drain the DNS result queue fast enough",
+      "signature_metrics": [
+        {"metric": "dns_resolutions_per_hour", "pattern": "falling (700k → 400k trending down)"},
+        {"metric": "awsem_dns_queue_depth", "pattern": "growing (10k → 40k trending toward high-water)"},
+        {"metric": "oracle_cpu_utilization_pct", "pattern": "LOW (Oracle idle — queue empty, not full)"}
+      ],
+      "distinguish_from": "DNS tool failure (CPU=0 AND queue full). Starvation shows empty queue + idle Oracle",
+      "pre_catastrophe_window_min": "20-40",
+      "reflex": "Check Oracle connectivity; verify dnsx process running; restart Oracle heartbeat monitor"
+    },
+    {
+      "id": "FS-02",
+      "name": "HTTP Rate-Limit Storm",
+      "description": "Target infrastructure rate-limiting httpx; Oracle backing off",
+      "signature_metrics": [
+        {"metric": "http_probes_per_hour", "pattern": "falling sharply (50k → 15k)"},
+        {"metric": "oracle_cpu_utilization_pct", "pattern": "dropping (httpx backing off = less CPU)"},
+        {"metric": "http_dlq_depth", "pattern": "growing slowly (rate-limited items retrying and failing)"},
+        {"metric": "http_error_rate_429", "pattern": "high (> 20% of probes receiving 429)"}
+      ],
+      "distinguish_from": "HTTP tool failure (DLQ grows fast and CPU is zero)",
+      "pre_catastrophe_window_min": "30-60",
+      "reflex": "Reduce HTTP concurrency by 30%; increase 429 cooldown to 120s; alert Mattermost"
+    },
+    {
+      "id": "FS-03",
+      "name": "Ingest Saturation",
+      "description": "Controller cannot write to Neo4j fast enough; ingest queue and checkpoint PENDING accumulating",
+      "signature_metrics": [
+        {"metric": "neo4j_write_latency_p95_ms", "pattern": "rising (200ms → 450ms trending toward 500ms)"},
+        {"metric": "ingest_queue_depth", "pattern": "growing"},
+        {"metric": "checkpoint_pending_count", "pattern": "increasing"},
+        {"metric": "clickhouse_insert_queue_rows", "pattern": "growing (ingest backup affects CH flush)"}
+      ],
+      "pre_catastrophe_window_min": "10-15",
+      "reflex": "Reduce Neo4j concurrent transactions 15 → 10; reduce batch size 500 → 200 ops/tx; alert"
+    },
+    {
+      "id": "FS-04",
+      "name": "ClickHouse Dedup Lag Spike",
+      "description": "ClickHouse background merge not keeping pace with INSERT rate; FINAL queries slowing",
+      "signature_metrics": [
+        {"metric": "clickhouse_parts_per_table", "pattern": "growing (100 → 600 trending toward 1000)"},
+        {"metric": "validate_reconciliation_query_duration_sec", "pattern": "rising (2s → 20s)"},
+        {"metric": "reconciliation_mismatch_pct", "pattern": "oscillating (spikes then resolves as merge catches up)"}
+      ],
+      "distinguish_from": "Real data mismatch (which does NOT resolve on its own)",
+      "pre_catastrophe_window_hr": "1-2",
+      "reflex": "Force OPTIMIZE TABLE subdomains FINAL; reduce ClickHouse INSERT rate; alert"
+    },
+    {
+      "id": "FS-05",
+      "name": "DLQ Cascade",
+      "description": "One lane DLQ accumulates → downstream lane starves → multiple lanes degrade in sequence",
+      "signature_metrics": [
+        {"metric": "[LaneX]_dlq_depth", "pattern": "growing rapidly (> 100 items/hr new accumulation)"},
+        {"metric": "[LaneX+1]_queue_depth", "pattern": "low (upstream starvation)"},
+        {"metric": "[LaneX+1]_probes_per_hour", "pattern": "falling"},
+        {"metric": "multiple_lane_throughput", "pattern": "degrading simultaneously"}
+      ],
+      "distinguish_from": "Single-lane failure (only one lane affected)",
+      "pre_catastrophe_window_min": "30-60",
+      "reflex": "Investigate Lane X DLQ root cause first; do not treat downstream lanes in isolation"
+    },
+    {
+      "id": "FS-06",
+      "name": "Oracle Memory Pressure",
+      "description": "Nuclei or katana processing large-response target → buffering into Oracle RAM → approaching OOM",
+      "signature_metrics": [
+        {"metric": "oracle_memory_utilization_pct", "pattern": "rising (50% → 80% trending)"},
+        {"metric": "enrich_targets_per_hour", "pattern": "falling (Oracle slowing under memory pressure)"},
+        {"metric": "enrich_dlq_depth", "pattern": "growing (memory-pressured targets failing timeout)"},
+        {"metric": "nuclei_process_restart_count", "pattern": "increasing (OOM kills)"}
+      ],
+      "distinguish_from": "Oracle CPU overload (CPU high; memory stable)",
+      "pre_catastrophe_window_min": "20-40",
+      "reflex": "Reduce enrich concurrency 25 → 10; add nuclei output size limit; alert; investigate large-response targets in DLQ"
+    },
+    {
+      "id": "FS-07",
+      "name": "Checkpoint Store Failure",
+      "description": "Redis not persisting checkpoints; ingest continues without durable checkpoints — replay integrity violation",
+      "signature_metrics": [
+        {"metric": "checkpoint_pending_age_min", "pattern": "rising for ALL batches (not just one)"},
+        {"metric": "checkpoint_write_error_rate", "pattern": "> 0 (Redis connection errors in controller logs)"},
+        {"metric": "ingest_throughput", "pattern": "still running (controller continues without checkpoint — DANGEROUS)"}
+      ],
+      "distinguish_from": "Single stale checkpoint (isolated to one batch_id)",
+      "pre_catastrophe_window": "IMMEDIATE — every ingest write without checkpoint is a replay integrity violation",
+      "reflex": "HALT ingest immediately; switch to SQLite WAL fallback; do not resume until checkpoint store confirmed healthy"
+    },
+    {
+      "id": "FS-08",
+      "name": "Neo4j Lock Contention",
+      "description": "Multiple concurrent MERGE transactions competing on same Subdomain node (DNS + HTTP simultaneous writes)",
+      "signature_metrics": [
+        {"metric": "neo4j_write_latency_p95_ms", "pattern": "spike from 200ms to > 2000ms"},
+        {"metric": "neo4j_deadlock_rate", "pattern": "> 0 (visible in Neo4j logs)"},
+        {"metric": "ingest_error_rate", "pattern": "rising (transactions failing with LockException)"},
+        {"metric": "ingest_throughput", "pattern": "variable (some batches fast, some very slow)"}
+      ],
+      "distinguish_from": "General Neo4j slowness (uniformly elevated latency, not variance)",
+      "pre_catastrophe_window_min": "5-10",
+      "reflex": "Reduce Neo4j concurrent transactions 15 → 5; add exponential backoff retry; investigate hotspot Subdomain nodes"
+    }
+  ],
+
+  "validation_strategy": [
+    {"check": "Redis AOF active", "method": "redis-cli CONFIG GET appendonly", "pass_condition": "appendonly yes"},
+    {"check": "Neo4j constraint applied", "method": "SHOW CONSTRAINTS", "pass_condition": "Subdomain.name UNIQUE exists"},
+    {"check": "Neo4j timeout set", "method": "grep transaction.timeout neo4j.conf", "pass_condition": "60s"},
+    {"check": "ClickHouse FINAL in code", "method": "grep -r 'FROM subdomains' --include='*.py'", "pass_condition": "All instances include FINAL"},
+    {"check": "Tool timeouts", "method": "Oracle invocation log per tool", "pass_condition": "Timeout error on 30s/5min marker"},
+    {"check": "ORS heartbeat", "method": "External watchdog received heartbeat", "pass_condition": "Last heartbeat < 60s ago"},
+    {"check": "Firewall rules", "method": "nmap -p 7687,9000,6379 [controller_ip] from external host", "pass_condition": "Connection refused"},
+    {"check": "Alert dedup", "method": "Trigger test alert 10x in 5 min", "pass_condition": "Only 1 Mattermost message"},
+    {"check": "HALT on checkpoint failure", "method": "Kill Redis; run ingest", "pass_condition": "Controller halts; switches to SQLite"},
+    {"check": "Write order assertion", "method": "Inject Neo4j failure; observe CH", "pass_condition": "No CH write on Neo4j failure"}
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "ORS process fails silently without heartbeat monitor", "severity": "CRITICAL", "probability": "MEDIUM", "mitigation": "C5.1 (ORS heartbeat) is the primary mitigation; without it, ORS failure is invisible"},
+    {"id": "R2", "title": "Redis evicts checkpoint data under memory pressure", "severity": "CRITICAL", "probability": "MEDIUM", "mitigation": "C1.5 (noeviction policy); verified via Redis CONFIG GET maxmemory-policy"},
+    {"id": "R3", "title": "Neo4j constraint missing allows silent duplicate nodes", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "C2.1 applied before first write; verified via SHOW CONSTRAINTS"},
+    {"id": "R4", "title": "ClickHouse FINAL missing in reconciliation query", "severity": "HIGH", "probability": "HIGH", "mitigation": "C3.2 code audit; add FINAL to all reconciliation queries"},
+    {"id": "R5", "title": "Oracle tool timeout not set; runaway nuclei blocks Enrich lane", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "C7.3 enforced at Oracle invocation level"},
+    {"id": "R6", "title": "Controller credential in source code committed to git", "severity": "CRITICAL", "probability": "LOW", "mitigation": "C8.5 verified before first commit; gitignore enforced"},
+    {"id": "R7", "title": "Alert flood during sustained degradation", "severity": "MEDIUM", "probability": "HIGH", "mitigation": "Alert dedup window (C5.3) prevents Mattermost flood"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Implement ORS heartbeat watchdog (C5.1) — most dangerous gap; ORS silence is invisible without it"},
+    {"priority": 2, "id": "REC-02", "action": "Set Redis noeviction + verify AOF before first production write (C1.1, C1.5)"},
+    {"priority": 3, "id": "REC-03", "action": "Apply Neo4j schema constraints (C2.1) and verify with SHOW CONSTRAINTS"},
+    {"priority": 4, "id": "REC-04", "action": "Code audit: FINAL in all ClickHouse reconciliation queries (C3.2)"},
+    {"priority": 5, "id": "REC-05", "action": "Set per-tool timeouts on Oracle (C7.3): dnsx 30s, httpx 30s, nuclei 5 min"},
+    {"priority": 6, "id": "REC-06", "action": "Set Neo4j transaction timeout 60s (C2.5) and max connections 50 (C2.11)"},
+    {"priority": 7, "id": "REC-07", "action": "Implement failure signature detection in ORS for FS-01 through FS-08"},
+    {"priority": 8, "id": "REC-08", "action": "Add alert deduplication (10 min window) and reflex suppression (30 min) to all ORS alerts"},
+    {"priority": 9, "id": "REC-09", "action": "Enforce firewall rules: only controller/oracle IPs accepted on ports 7687, 9000, 6379 (C8.9)"},
+    {"priority": 10, "id": "REC-10", "action": "Run hardening checklist verification before each 72h operation window start"}
+  ],
+
+  "kpis": {
+    "critical_items_completed_before_first_write_pct": 100,
+    "alert_false_positive_rate_max_pct": 5,
+    "mttr_from_ors_alert_to_resolution_min_max": 20,
+    "failure_signature_recognition_time_min_max": 5,
+    "slo_breach_rate_per_24h_max": 1,
+    "undetected_failure_classes": 0
+  },
+
+  "metrics": {
+    "hardening_layers_covered": 8,
+    "checklist_items_total": 81,
+    "checklist_items_critical": 20,
+    "slo_definitions": 14,
+    "alert_catalog_entries": 15,
+    "failure_signatures": 8,
+    "validation_checks": 10,
+    "pre_write_critical_items": 23
+  },
+
+  "assumptions": [
+    "A1: ORS has an API surface for heartbeat emission; external watchdog (cron + HTTP check) is acceptable",
+    "A2: Redis version supports AOF and noeviction maxmemory-policy (Redis 3.0+)",
+    "A3: Neo4j version supports schema constraints (Neo4j 4.0+)",
+    "A4: ClickHouse version supports FINAL keyword and ReplacingMergeTree (ClickHouse 21.6+)",
+    "A5: Mattermost webhook is available for ORS alert routing",
+    "A6: Oracle exposes system metrics (CPU, memory) accessible to Controller ORS via HTTP endpoint or SSH command",
+    "A7: Alert dedup implementation is at ORS level (not Mattermost); ORS tracks last-sent time per alert ID"
+  ]
+}
