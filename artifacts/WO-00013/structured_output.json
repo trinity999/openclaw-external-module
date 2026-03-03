@@ -1,0 +1,277 @@
+{
+  "work_order": "WO-00013",
+  "category": "research",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.92,
+
+  "key_findings": [
+    "Recommended stack: FastAPI (API) + React 18 + Vite 5 (frontend) — Python API reuses controller ecosystem; React provides mature table/graph/chart components needed by WO-00012 IA",
+    "Additional monthly ops cost for Phase 1–2: $0 — FastAPI on controller host, React static build served by nginx alongside existing services",
+    "Phase 3 VPS split (optional): $4–20/mo on Hetzner CX21/CX32 if api_p95_latency_ms ORS signal triggers",
+    "TanStack Table v8 chosen for analyst tables — virtualised rows, server-side sort/filter, React-native; Svelte equivalent is community-maintained and less featured",
+    "Cytoscape.js (graph view) must be dynamically imported (code-split) — 300KB library only loaded on Attack Surface Map route; initial bundle target <150KB",
+    "URL-encoded filter state (React Router URLSearchParams) must be implemented day 1 — cannot be retrofitted cheaply into existing component tree",
+    "Rollback: API = symlink swap to previous version (<10s downtime); Frontend = nginx symlink swap to previous static build (<0s downtime); no database migration needed",
+    "FastAPI + Next.js rejected: SSR adds ops burden (Node.js process) with no benefit for internal non-SEO tool; FastAPI + SvelteKit rejected: smaller ecosystem, less mature table/graph libraries",
+    "Neo4j self-hosted retained: Aura Professional costs $65/mo with no operational benefit for internal tooling at current scale",
+    "ORS trigger for VPS split: api_p95_latency_ms > 2000 for 3 consecutive minutes — explicit signal prevents premature infrastructure cost"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "FastAPI + React/Vite over FastAPI + Next.js or SvelteKit",
+      "summary": "Python API (FastAPI) eliminates language mismatch with controller; React ecosystem provides mature TanStack Table/Query and Cytoscape.js; zero additional infra cost in Phase 1–2",
+      "rationale": "SSR (Next.js/SvelteKit) provides no benefit for internal non-SEO tooling. SvelteKit ecosystem lacks mature table and graph components needed by the 8-view IA design. FastAPI reuses the same neo4j-driver and clickhouse-connect packages already tested in the controller codebase.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Deployment on controller host (Phase 1–2), VPS split deferred (Phase 3+)",
+      "summary": "FastAPI (systemd/Uvicorn) co-located with controller; nginx serves static React build and proxies /api/*; zero additional monthly cost",
+      "rationale": "Phase 1–2 analyst query load (2–5 concurrent analysts) does not justify separate VPS. Controller host headroom is sufficient. VPS split triggered by ORS signal, not by schedule.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "TanStack Query v5 for all API calls including 30s Operations Log polling",
+      "summary": "TanStack Query handles server state, cache invalidation, background refetch intervals, and loading/error states; no additional state management library needed",
+      "rationale": "Operations Log requires 30s auto-refresh. TanStack Query's refetchInterval option handles this with zero custom code, automatic background refetch, and stale-while-revalidate semantics. Replaces Redux/Zustand for server state.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "Cytoscape.js dynamically imported (code-split)",
+      "summary": "Graph library (~300KB) loaded only when Attack Surface Map route is activated; dynamic import at Phase 3; prevents initial bundle bloat",
+      "rationale": "Phase 1–2 analysts never load the graph view. Including Cytoscape.js in the initial bundle would double the JS payload unnecessarily. React.lazy() + Suspense enables clean code splitting with loading fallback.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Neo4j self-hosted retained; Aura Professional rejected",
+      "summary": "Aura Professional costs $65/mo with no operational benefit for internal tooling at current 10M+ subdomain scale",
+      "rationale": "Self-hosted Neo4j already operational, already tuned for KRIL/dedup workloads. Aura would add $65/mo for managed hosting with no latency or reliability improvement on internal LAN. Migration risk exceeds benefit.",
+      "stability_impact": "neutral"
+    },
+    {
+      "id": "D6",
+      "title": "CSV export: client-side from JSON response; PDF export: browser print dialog",
+      "summary": "No server-side PDF generation library (wkhtmltopdf, WeasyPrint) — uses @media print CSS; CSV generated client-side with papaparse + FileSaver",
+      "rationale": "Server-side PDF adds ops complexity (headless Chrome, wkhtmltopdf system dep). Browser print-to-PDF is sufficient for Executive Summary export. CSV is a direct JSON → CSV transform, trivially done client-side.",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "recommended_stack": {
+    "api": {
+      "language": "Python 3.12+",
+      "framework": "FastAPI 0.115+",
+      "server": "Gunicorn + Uvicorn workers (4 workers)",
+      "validation": "Pydantic v2",
+      "config": "python-dotenv + Pydantic settings",
+      "database_drivers": [
+        {"store": "Neo4j", "driver": "neo4j 5.x", "notes": "official async driver, built-in connection pool"},
+        {"store": "ClickHouse", "driver": "clickhouse-connect 0.7+", "notes": "HTTP-based, async, handles FINAL queries"}
+      ],
+      "bind": "127.0.0.1:8000",
+      "process_manager": "systemd (recon-api.service)"
+    },
+    "frontend": {
+      "framework": "React 18",
+      "build_tool": "Vite 5",
+      "routing": "React Router v6",
+      "libraries": [
+        {"name": "TanStack Query v5", "purpose": "server state, polling, cache"},
+        {"name": "TanStack Table v8", "purpose": "sortable/filterable analyst tables, virtualised rows"},
+        {"name": "recharts 2.x", "purpose": "throughput area chart, severity bar chart"},
+        {"name": "Cytoscape.js 3.x", "purpose": "graph view (Phase 3 only, dynamically imported)"},
+        {"name": "Tailwind CSS 3.x", "purpose": "utility-first CSS, zero design system overhead"},
+        {"name": "papaparse + FileSaver", "purpose": "client-side CSV export from API JSON"}
+      ],
+      "initial_bundle_target_kb": 150,
+      "deployment": "static build served by nginx (/var/www/recon-ui/)"
+    },
+    "reverse_proxy": {
+      "server": "nginx",
+      "api_location": "/api/* → proxy_pass http://127.0.0.1:8000",
+      "static_location": "/* → /var/www/recon-ui; try_files SPA fallback",
+      "listen": 80,
+      "tls": "optional; HTTP sufficient for LAN-only v1"
+    }
+  },
+
+  "candidate_matrix": [
+    {
+      "id": "C1",
+      "name": "FastAPI + React/Vite",
+      "verdict": "RECOMMENDED",
+      "ops_overhead": "low",
+      "dev_familiarity": "high",
+      "performance": "high",
+      "graph_support": "full (Cytoscape.js)",
+      "ecosystem_maturity": "very_high",
+      "monthly_cost_phase_1_2": "$0",
+      "monthly_cost_phase_3": "$0-40/mo (VPS optional)"
+    },
+    {
+      "id": "C2",
+      "name": "FastAPI + Next.js",
+      "verdict": "REJECTED",
+      "rejection_reason": "SSR unnecessary for internal tool; Node.js adds second language/process; $30-60/mo vs $0 with no benefit",
+      "ops_overhead": "medium",
+      "dev_familiarity": "medium",
+      "performance": "high",
+      "graph_support": "full (react-force-graph)",
+      "ecosystem_maturity": "very_high",
+      "monthly_cost_phase_1_2": "$30-60/mo"
+    },
+    {
+      "id": "C3",
+      "name": "FastAPI + SvelteKit",
+      "verdict": "REJECTED",
+      "rejection_reason": "Smaller ecosystem; TanStack Table not natively supported; Cytoscape.js Svelte adapter immature; team familiarity cost",
+      "ops_overhead": "medium",
+      "dev_familiarity": "low_medium",
+      "performance": "very_high",
+      "graph_support": "partial (d3 only)",
+      "ecosystem_maturity": "medium",
+      "monthly_cost_phase_1_2": "$0-30/mo"
+    }
+  ],
+
+  "api_endpoints": [
+    {"path": "/api/v1/subdomains", "method": "GET", "backend": "Neo4j", "filters": ["kril_score_range", "resolution_status", "http_positive", "has_findings", "finding_severity", "root_domain", "first_seen_range", "ip_address"], "default_sort": "kril_score DESC"},
+    {"path": "/api/v1/subdomains/{fqdn}", "method": "GET", "backend": "Neo4j", "notes": "full detail: IPs, endpoints, findings, CNAME chain, technologies"},
+    {"path": "/api/v1/subdomains/{fqdn}/endpoints", "method": "GET", "backend": "Neo4j", "filters": ["status_code", "content_type", "has_title", "dynamic_content"]},
+    {"path": "/api/v1/findings", "method": "GET", "backend": "Neo4j", "filters": ["severity", "finding_class", "template_id_search", "kril_score_range", "fqdn_search", "root_domain", "confirmed_after", "confirmed_before"], "default_sort": "severity DESC, kril_score DESC"},
+    {"path": "/api/v1/findings.csv", "method": "GET", "backend": "Neo4j", "notes": "same filter params as /findings; streams CSV content-type"},
+    {"path": "/api/v1/graph/neighbors", "method": "GET", "backend": "Neo4j", "params": ["fqdn", "depth (1-3)"], "max_nodes": 500, "node_priority": "kril_score DESC"},
+    {"path": "/api/v1/stats/summary", "method": "GET", "backend": "ClickHouse", "notes": "materialized view aggregate; SLO: <1s"},
+    {"path": "/api/v1/stats/throughput", "method": "GET", "backend": "ClickHouse", "notes": "time-series for Operations Log throughput panel"}
+  ],
+
+  "deployment_options": [
+    {
+      "id": "OPT-A",
+      "name": "Controller host co-location",
+      "recommended_for": "Phase 1–2",
+      "monthly_cost": "$0",
+      "components": ["FastAPI (systemd)", "nginx", "React static build"],
+      "api_bind": "127.0.0.1:8000",
+      "nginx_port": 80,
+      "rollback_time_sec": 10
+    },
+    {
+      "id": "OPT-B",
+      "name": "Separate VPS",
+      "recommended_for": "Phase 3+ (triggered by ORS signal)",
+      "ors_trigger": "api_p95_latency_ms > 2000 for 3 consecutive minutes",
+      "monthly_cost": "$4-20/mo (Hetzner CX21 or DigitalOcean Basic)",
+      "components": ["FastAPI (systemd or Docker)", "nginx", "React static build"],
+      "network": "internal VPN to Neo4j + ClickHouse on controller host",
+      "rollback_time_sec": 60
+    }
+  ],
+
+  "cost_model": {
+    "phase_1_2_additional_monthly": "$0",
+    "phase_3_vps_optional": "$4-20/mo",
+    "neo4j_aura_professional_rejected": "$65/mo (no benefit over self-hosted for internal tool)",
+    "components_on_existing_infrastructure": ["FastAPI", "nginx", "React static build", "Neo4j", "ClickHouse"]
+  },
+
+  "rollback_plan": {
+    "api": {
+      "strategy": "versioned_symlink",
+      "procedure": "systemctl stop recon-api; ln -sfn /opt/recon-api-versions/<prev> /opt/recon-api; systemctl start recon-api",
+      "downtime_sec": 10,
+      "versions_retained": 3
+    },
+    "frontend": {
+      "strategy": "versioned_directory_symlink",
+      "procedure": "ln -sfn /var/www/recon-ui-<prev> /var/www/recon-ui; nginx -s reload",
+      "downtime_sec": 0,
+      "versions_retained": 3
+    },
+    "database": {
+      "api_writes": "read-only for Phase 1–2; no migration needed",
+      "property_changes": "update FastAPI query layer only; no data migration",
+      "clickhouse": "additive materialized views only; deprecated after validation"
+    },
+    "blue_green": {
+      "supported": true,
+      "procedure": "Run new API on :8001; smoke test; nginx upstream swap; stop :8000",
+      "downtime_sec": 0
+    }
+  },
+
+  "implementation_phases": [
+    {
+      "phase": 1,
+      "name": "Operations Log + Asset Discovery + Asset Detail",
+      "api_deliverables": ["/api/v1/stats/summary", "/api/v1/stats/throughput", "/api/v1/subdomains", "/api/v1/subdomains/{fqdn}"],
+      "frontend_deliverables": ["React+Vite scaffold", "TanStack Query polling (30s)", "TanStack Table for Asset Discovery", "URL-encoded filter state"],
+      "infrastructure": ["FastAPI systemd unit", "nginx config with SPA fallback", "npm build deploy to /var/www/recon-ui"]
+    },
+    {
+      "phase": 2,
+      "name": "Finding Triage + Template Detail + Executive Summary",
+      "api_deliverables": ["/api/v1/findings", "/api/v1/findings.csv"],
+      "frontend_deliverables": ["Finding Triage TanStack Table", "Template Detail view", "Executive Summary with recharts", "CSV/PDF export"]
+    },
+    {
+      "phase": 3,
+      "name": "Attack Surface Map + HTTP Endpoint Browser",
+      "api_deliverables": ["/api/v1/graph/neighbors", "/api/v1/subdomains/{fqdn}/endpoints"],
+      "frontend_deliverables": ["Cytoscape.js dynamic import", "Graph view (500 node cap, KRIL-sized nodes)", "HTTP Endpoint Browser with preset filters"]
+    }
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "FastAPI latency under concurrent analyst load", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Async neo4j driver + pool_size=50; ClickHouse materialized views for aggregates; ORS signal api_p95_latency_ms"},
+    {"id": "R2", "title": "Cytoscape.js bundle bloat in initial load", "severity": "LOW", "probability": "LOW", "mitigation": "Dynamic import (React.lazy); only loaded on /graph route; initial bundle target <150KB"},
+    {"id": "R3", "title": "TanStack Table breaks on 50k+ unvirtualised rows", "severity": "MEDIUM", "probability": "LOW", "mitigation": "API pagination (page_size=100); virtualised row renderer for in-memory data"},
+    {"id": "R4", "title": "React scope creep before Phase 1 ships", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "Phase gate enforcement: no graph imports until Phase 3; no additional views before Phase 1 complete"},
+    {"id": "R5", "title": "nginx SPA routing breaks on direct URL access", "severity": "LOW", "probability": "LOW", "mitigation": "try_files $uri $uri/ /index.html in nginx config"},
+    {"id": "R6", "title": "ClickHouse FINAL query latency on high-ingest period", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "API queries materialized view not raw table; 30s refresh SLO acceptable"},
+    {"id": "R7", "title": "VPS cost trigger not defined", "severity": "LOW", "probability": "MEDIUM", "mitigation": "ORS signal api_p95_latency_ms > 2000 for 3 consecutive minutes triggers VPS split evaluation"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Scaffold FastAPI with /api/v1/stats/summary and /api/v1/subdomains first — enables Operations Log and Asset Discovery (Phase 1)"},
+    {"priority": 2, "id": "REC-02", "action": "Create systemd unit and nginx config (SPA fallback + API proxy) before writing first React component"},
+    {"priority": 3, "id": "REC-03", "action": "Implement URL-encoded filter state (React Router URLSearchParams) from day 1 — cannot retrofit cheaply"},
+    {"priority": 4, "id": "REC-04", "action": "Use TanStack Query refetchInterval for Operations Log 30s polling — zero custom code"},
+    {"priority": 5, "id": "REC-05", "action": "Set up Vite dynamic import scaffold for Cytoscape.js from Phase 1 — prevents bundle bloat at Phase 3"},
+    {"priority": 6, "id": "REC-06", "action": "Add ORS signal api_p95_latency_ms — triggers VPS split if controller host saturates"},
+    {"priority": 7, "id": "REC-07", "action": "Retain last 3 frontend builds in versioned directories — enables 0s rollback via nginx symlink swap"},
+    {"priority": 8, "id": "REC-08", "action": "Use ClickHouse materialized views for all /api/v1/stats/* — required for ≤1s filter SLO"}
+  ],
+
+  "metrics": {
+    "candidates_evaluated": 3,
+    "phases_defined": 3,
+    "api_endpoints_specified": 8,
+    "additional_monthly_cost_phase_1_2_usd": 0,
+    "additional_monthly_cost_phase_3_max_usd": 40,
+    "api_rollback_downtime_sec": 10,
+    "frontend_rollback_downtime_sec": 0,
+    "initial_js_bundle_target_kb": 150,
+    "graph_library_size_kb": 300,
+    "neo4j_connection_pool_size": 50,
+    "operations_log_refresh_interval_sec": 30,
+    "api_p95_latency_target_ms": 500,
+    "api_p95_latency_vps_trigger_ms": 2000
+  },
+
+  "assumptions": [
+    "A1: Controller host has sufficient CPU headroom for 4 Uvicorn workers alongside existing processes",
+    "A2: neo4j-driver 5.x async session compatible with existing Neo4j version on controller",
+    "A3: ClickHouse materialized views exist for stats aggregates (required by WO-00012 filter performance targets)",
+    "A4: Internal LAN access only for v1; HTTP without TLS acceptable; nginx TLS optional if needed",
+    "A5: npm and Python 3.12 build toolchain available on controller or CI for deployments",
+    "A6: Authentication deferred to v1.1 (WO-00012 A5); no JWT/session middleware in Phase 1",
+    "A7: Python 3.11+ on controller host (FastAPI + Pydantic v2 requirement)"
+  ]
+}
