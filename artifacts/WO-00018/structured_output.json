@@ -1,0 +1,195 @@
+{
+  "work_order": "WO-00018",
+  "category": "architecture",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "confidence": 0.91,
+
+  "key_findings": [
+    "Three-layer scheduler policy: WFQ with debt tracking (base fairness), Starvation Floor Guard (hard minimum guarantee per lane per 60s), Burst Headroom Controller (DNS consecutive dispatch cap) — each layer addresses a distinct failure mode",
+    "WFQ debt-tracking produces weighted scheduling ratios (DNS 50%, HTTP 30%, Enrich 20%) without hard rate limits — utilizes oracle fully during high-throughput DNS phases while guaranteeing proportional access to all lanes",
+    "Starvation floor guarantees minimum 1 dispatch per lane per 60-second window for any lane with pending work — starvation incidents = 0 by construction; force-dispatch is the hard safety net below WFQ",
+    "Burst headroom cap (dns_max_consecutive_dispatches=3) prevents DNS burst from occupying oracle continuously; forces yield to HTTP/Enrich after 3 consecutive DNS dispatches — prevents executor-time starvation even when WFQ weights are satisfied",
+    "Debt accumulation bounded by max_debt_cap=10.0 and debt_reset_idle_sec=60 — prevents lanes from accumulating unbounded debt during idle periods and causing burst imbalance when they become active",
+    "Utilization band target 75-90%: below 75% = oracle underutilized (increase batch_size or frequency); above 90% = approaching saturation (reduce burst cap); variance reduction target >=20% vs naive FIFO",
+    "starvation_floor_activations ORS signal: if >3/hr per lane, WFQ weights are mistuned for current workload; hot-reloadable weights enable in-operation rebalancing without restart",
+    "KRIL ordering preserved within each lane queue — starvation floor force-dispatch selects highest-KRIL item within the lane; fairness applies between lanes, not within lanes"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "WFQ with debt-tracking over round-robin or strict rate limits",
+      "summary": "Weighted debt accumulation selects highest-debt lane at each tick; produces weighted scheduling ratios without hard throughput caps",
+      "rationale": "Round-robin ignores lane throughput differences: fast DNS lane gets same slots as slow Enrich, wasting oracle capacity. Strict rate limits artificially idle oracle during DNS-heavy phases. WFQ produces correct utilization ratios while adapting to actual workload mix.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Starvation floor as separate hard guarantee below WFQ",
+      "summary": "WFQ debt ratios guarantee fair share over long windows; starvation floor guarantees minimum 1 dispatch per 60s window for any pending lane",
+      "rationale": "WFQ over infinite windows produces correct ratios, but in finite windows (60s), a heavily loaded DNS queue can starve Enrich. The floor is the safety net that WFQ theory alone cannot provide in finite time.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "Burst headroom cap via max_consecutive_dispatches per lane",
+      "summary": "After N consecutive dispatches of the same lane, scheduler forces yield to any other eligible lane regardless of debt ordering",
+      "rationale": "WFQ addresses scheduling slot fairness. But a single large-batch dispatch (500 DNS records) occupies oracle executor for many seconds, starving other lanes of execution time even if they have scheduling slots. Consecutive cap enforces executor-time fairness.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "Debt cap and idle reset to bound debt accumulation",
+      "summary": "max_debt_cap=10.0 prevents unbounded debt during idle; debt_reset_idle_sec=60 resets debt after lane has been idle >60s",
+      "rationale": "Without a cap, a lane that is idle for hours accumulates enormous debt. When it becomes active, WFQ dispatches it exclusively until debt is consumed — effectively causing burst starvation of other lanes. Cap and reset bound this effect.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "KRIL ordering preserved within each lane queue",
+      "summary": "Fairness policy governs between-lane scheduling; within each lane, KRIL-ordered priority queue governs which item is dispatched",
+      "rationale": "Fairness between lanes ensures all lane types get service. Value ordering within each lane ensures the most valuable work within each type is processed first. These are orthogonal concerns; combining them would require complex cross-lane ordering.",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "scheduler_layers": [
+    {
+      "id": "layer_1",
+      "name": "WFQ Debt Tracker",
+      "mechanism": "Per-lane debt accumulation at each tick proportional to weight; highest-debt eligible lane selected for dispatch",
+      "weights": {"dns": 0.50, "http": 0.30, "enrich": 0.20},
+      "tick_interval_sec": 1.0,
+      "debt_formula": "lane.debt += lane.weight if has_pending_work(lane)",
+      "dispatch_selection": "max(eligible_lanes, key=lambda l: l.debt); selected.debt -= 1.0",
+      "debt_bounds": {"max_debt_cap": 10.0, "reset_after_idle_sec": 60}
+    },
+    {
+      "id": "layer_2",
+      "name": "Starvation Floor Guard",
+      "mechanism": "At end of each 60s window, any lane with pending work that received 0 dispatches gets a forced dispatch",
+      "window_sec": 60,
+      "min_dispatches_per_lane": 1,
+      "ors_signal": "starvation_floor_activations",
+      "ors_alert_threshold": "starvation_floor_activations > 3/hr",
+      "effect": "starvation incidents = 0 by construction"
+    },
+    {
+      "id": "layer_3",
+      "name": "Burst Headroom Controller",
+      "mechanism": "Per-lane consecutive dispatch counter; after max_consecutive_dispatches, force yield to other eligible lanes",
+      "max_consecutive_dispatches": {"dns": 3, "http": 5, "enrich": 10},
+      "rationale": "Prevents executor-time starvation even when WFQ scheduling slots are weighted correctly; large DNS batches otherwise monopolize oracle wall-clock time"
+    }
+  ],
+
+  "lane_config": {
+    "dns": {
+      "weight": 0.50,
+      "batch_size": 500,
+      "max_consecutive_dispatches": 3,
+      "max_debt_cap": 10.0,
+      "debt_reset_idle_sec": 60
+    },
+    "http": {
+      "weight": 0.30,
+      "batch_size": 100,
+      "max_consecutive_dispatches": 5,
+      "max_debt_cap": 10.0,
+      "debt_reset_idle_sec": 60
+    },
+    "enrich": {
+      "weight": 0.20,
+      "batch_size": 10,
+      "max_consecutive_dispatches": 10,
+      "max_debt_cap": 10.0,
+      "debt_reset_idle_sec": 60
+    }
+  },
+
+  "utilization_policy": {
+    "target_band_floor_pct": 75,
+    "target_band_ceiling_pct": 90,
+    "observation_window_sec": 30,
+    "below_floor_reflex": "increase batch_size or dispatch frequency",
+    "above_ceiling_reflex": "reduce burst cap; reduce batch_size"
+  },
+
+  "ors_signals": [
+    {"signal": "node_utilization_pct", "frequency_sec": 30, "alert_below": 75, "alert_above": 90},
+    {"signal": "lane_queue_depth_{lane}", "frequency_sec": 30, "alert_condition": "depth > configured_max"},
+    {"signal": "starvation_floor_activations", "frequency": "per_event", "alert_condition": "> 3/hr per lane"},
+    {"signal": "dispatch_latency_p95_ms", "frequency_sec": 30, "alert_condition": "> 500ms"},
+    {"signal": "scheduler_config_version", "frequency": "on_reload", "purpose": "audit"}
+  ],
+
+  "starvation_incident_definition": {
+    "definition": "A lane with pending work that receives 0 dispatches in a 60-second window",
+    "target": "approximately 0",
+    "guarantee_mechanism": "starvation_floor layer forces minimum 1 dispatch per window"
+  },
+
+  "variance_reduction": {
+    "baseline_model": "naive FIFO dispatch; DNS dominates during peak; sigma ~18%",
+    "policy_model": "WFQ + floor + burst cap; sigma ~12%",
+    "estimated_reduction_pct": 33,
+    "target_pct": 20,
+    "measurement": "std_dev of oracle utilization across 1-minute intervals over 72h"
+  },
+
+  "scheduler_config": {
+    "file": "scheduler_config.json",
+    "hot_reloadable": true,
+    "reload_latency_target_sec": 5,
+    "fields": ["weights", "batch_sizes", "max_consecutive_dispatches", "max_debt_cap", "debt_reset_idle_sec", "starvation_floor_window_sec", "utilization_floor_pct", "utilization_ceiling_pct"]
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "WFQ weights mistuned for actual lane throughput", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "starvation_floor_activations ORS signal alerts if >3/hr; hot-reloadable weights enable in-operation rebalancing"},
+    {"id": "R2", "title": "Burst cap too aggressive: DNS underutilizes oracle", "severity": "MEDIUM", "probability": "LOW", "mitigation": "utilization_below_floor ORS reflex; relax dns_max_consecutive_dispatches via hot-reload"},
+    {"id": "R3", "title": "Debt burst on lane reactivation after idle", "severity": "LOW", "probability": "MEDIUM", "mitigation": "debt_reset_idle_sec (60s) + max_debt_cap (10.0) bounds accumulated debt"},
+    {"id": "R4", "title": "Starvation floor force-dispatch disrupts KRIL ordering", "severity": "LOW", "probability": "LOW", "mitigation": "Force-dispatch still selects highest-KRIL item within the lane queue; KRIL order preserved within lanes"},
+    {"id": "R5", "title": "Oracle saturation despite burst cap", "severity": "HIGH", "probability": "LOW", "mitigation": "utilization_above_ceiling ORS reflex reduces batch_size; alert if sustained >5 min"},
+    {"id": "R6", "title": "Hot-reload disrupts in-flight dispatches", "severity": "LOW", "probability": "MEDIUM", "mitigation": "Hot-reload applies at next tick only; in-flight dispatches complete with previous config"},
+    {"id": "R7", "title": "Scheduler tick overhead at 1s", "severity": "LOW", "probability": "LOW", "mitigation": "Tick is O(n_lanes=3) arithmetic; negligible CPU cost on controller"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Implement WFQ debt tracker with weights 0.50/0.30/0.20 (DNS/HTTP/Enrich) as base scheduler — delivers weighted fairness from day 1"},
+    {"priority": 2, "id": "REC-02", "action": "Add starvation floor guard (60s window, min 1 dispatch per pending lane) — hard guarantee against starvation; immediately eliminates starvation incidents"},
+    {"priority": 3, "id": "REC-03", "action": "Set burst cap: DNS=3, HTTP=5, Enrich=10 consecutive dispatches before yield — prevents executor-time starvation during DNS burst phases"},
+    {"priority": 4, "id": "REC-04", "action": "Emit starvation_floor_activations as ORS signal; alert if >3/hr per lane — indicates WFQ weights need retuning for current workload"},
+    {"priority": 5, "id": "REC-05", "action": "Monitor oracle utilization every 30s; emit ORS signals for <75% and >90% — drives adaptive batch_size tuning"},
+    {"priority": 6, "id": "REC-06", "action": "Set debt_reset_idle_sec=60 and max_debt_cap=10.0 — bounds debt accumulation during idle periods and prevents reactivation burst"},
+    {"priority": 7, "id": "REC-07", "action": "Run 72-hour simulation with 70/20/10 DNS/HTTP/Enrich workload mix — validates starvation=0, utilization band, variance reduction before production"},
+    {"priority": 8, "id": "REC-08", "action": "Make all scheduler parameters hot-reloadable via scheduler_config.json — enables in-operation weight rebalancing without restart"}
+  ],
+
+  "metrics": {
+    "scheduler_layers": 3,
+    "lanes": 3,
+    "starvation_incident_target": 0,
+    "utilization_floor_pct": 75,
+    "utilization_ceiling_pct": 90,
+    "variance_reduction_target_pct": 20,
+    "starvation_floor_window_sec": 60,
+    "tick_interval_sec": 1,
+    "max_debt_cap": 10.0,
+    "debt_reset_idle_sec": 60,
+    "dns_max_consecutive_dispatches": 3,
+    "http_max_consecutive_dispatches": 5,
+    "enrich_max_consecutive_dispatches": 10,
+    "dispatch_latency_p95_target_ms": 500,
+    "config_reload_latency_target_sec": 5
+  },
+
+  "assumptions": [
+    "A1: Three lanes (DNS, HTTP, Enrich) are the complete set; new lanes require weight re-normalization",
+    "A2: Oracle execution time is measurable at the controller for utilization calculation",
+    "A3: Scheduler tick interval of 1s achievable without controller CPU bottleneck",
+    "A4: Starvation floor window of 60s is acceptable minimum service guarantee",
+    "A5: Lane queue depth readable by scheduler at each tick (in-memory queue on controller)",
+    "A6: scheduler_config.json hot-reload does not interrupt in-flight oracle dispatches"
+  ]
+}
