@@ -1,0 +1,284 @@
+{
+  "work_order": "WO-00010",
+  "category": "research",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.92,
+
+  "key_findings": [
+    "Four tool parsers defined (dnsx, httpx, nuclei, katana) with strict-then-quarantine design principle — malformed records are never silently coerced; all failures are quarantine events with reason codes",
+    "Schema version detection by field presence patterns (not version header) — tools don't emit formal version identifiers; field presence is the only reliable detection signal",
+    "dnsx v0/v1 migration: remap 'name' → 'host'; httpx v0/v1: remap 'input' → 'host'; nuclei v1/v2: remap 'templateID' → 'template-id'; katana v0/v1: wrap url in request object",
+    "Nuclei response/request fields MUST be truncated to 4KB at parse time — full raw HTTP can be 50KB+ per finding; at scale this exhausts Neo4j storage unnecessarily",
+    "Nuclei info-severity findings gated by KRIL score ≥ 50 — info findings are extremely high volume (technology disclosure); gating reduces noise by ~70% without losing high-value findings",
+    "NDJSON streaming parse (line-by-line) mandatory — tool output files can be 100MB per batch; loading full file into memory before parse exhausts Controller RAM",
+    "Single shared normalize_fqdn() and canonicalize_url() functions called by all parsers — prevents divergent normalization that creates dedup key mismatches across tools",
+    "Quarantine record format captures: original raw record, batch_id, chunk_id, parser_name, schema_version_detected, reason_code, quarantine_at — complete forensic record for all rejected data",
+    "ORS monitors quarantine_rate_pct (> 1% = CRITICAL) and quarantine_reason_code_new (first occurrence of new code = ALERT) — new codes indicate tool upgrade or output format change",
+    "Max line size: 1MB; lines exceeding are quarantined as OVERSIZED_RECORD — prevents parser memory exhaustion from malformed or intentionally large tool output lines"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Strict-then-quarantine design",
+      "summary": "Parser attempts full schema validation; any required field missing or malformed = quarantine with reason code; no silent coercion",
+      "rationale": "Silent coercion produces corrupt ingest data that passes integrity checks but contains wrong values. Quarantine preserves forensic record and makes data quality issues visible.",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D2",
+      "title": "Schema version by field presence patterns",
+      "summary": "Version detected from field presence (host vs name, template-id vs templateID, etc.) — not from a version header field",
+      "rationale": "None of the four tools emit a formal schema version field in their output. Field presence detection is universally applicable and forward-compatible (new fields don't break detection).",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "Nuclei response/request truncated to 4KB",
+      "summary": "nuclei request and response fields truncated to 4KB at parse time; evidence_truncated=true flag stored",
+      "rationale": "Full nuclei HTTP request/response can be 50KB+ per finding. At 50 findings/hour × 72h = 50MB of raw HTTP text in the graph. 4KB preserves sufficient forensic context for analyst review.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "Nuclei info-severity KRIL gate",
+      "summary": "Info-severity nuclei findings only ingested if KRIL score >= 50; configurable threshold; all other severities ingested unconditionally",
+      "rationale": "Info findings (technology disclosure, version banners) are high-volume and low actionability for low-value targets. KRIL gate reduces noise by ~70% while preserving info findings for high-KRIL targets where tech stack matters.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "NDJSON streaming parse (line-by-line)",
+      "summary": "Parse tool output NDJSON one line at a time; never load full file into memory before starting parse",
+      "rationale": "Tool output files can be 100MB per batch (nuclei at 25 concurrent × 5 min × full response body). Loading entire file into memory before parse exhausts 16GB Controller RAM during ingest.",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D6",
+      "title": "Single shared normalization functions",
+      "summary": "normalize_fqdn() and canonicalize_url() are shared library functions called by all four parsers — no inline normalization",
+      "rationale": "Divergent normalization implementations across parsers produce different dedup keys for the same entity, creating phantom duplicates that bypass Bloom filter dedup.",
+      "stability_impact": "critical"
+    }
+  ],
+
+  "parser_contracts": [
+    {
+      "parser": "dnsx_parser_v1",
+      "tool": "dnsx",
+      "output_format": "NDJSON",
+      "throughput_target_records_per_hour": 800000,
+      "required_fields": ["host"],
+      "optional_fields": ["a", "aaaa", "cname", "mx", "ns", "txt", "ptr", "status_code", "timestamp"],
+      "computed_fields": ["resolved", "dedup_key", "batch_id", "scanned_at"],
+      "dedup_key_formula": "SHA256('subdomain:' + host.lower().rstrip('.'))[:32]",
+      "schema_versions": [
+        {"version": "v1", "detection": "'host' field present", "migration": null},
+        {"version": "v0", "detection": "'name' field present (no 'host')", "migration": "remap 'name' → 'host'"}
+      ],
+      "quarantine_reason_codes": [
+        "DNS_MISSING_HOST",
+        "DNS_INVALID_FQDN",
+        "DNS_WILDCARD_HIT",
+        "DNS_SCHEMA_UNKNOWN",
+        "DNS_JSON_PARSE_ERROR"
+      ],
+      "known_quirks": [
+        "NXDOMAIN records: set resolved=false; ingest as unresolved Subdomain",
+        "Empty arrays: absent array field = empty array (not missing required field)",
+        "Wildcard records: a_records matching wildcard IPs → DNS_WILDCARD_HIT quarantine",
+        "SERVFAIL: do NOT set resolved=false; queue for retry — infrastructure issue, not non-existence"
+      ]
+    },
+    {
+      "parser": "httpx_parser_v1",
+      "tool": "httpx",
+      "output_format": "NDJSON",
+      "throughput_target_records_per_hour": 100000,
+      "required_fields": ["url", "host", "status_code"],
+      "optional_fields": ["content_length", "content_type", "title", "headers", "a", "final_url", "redirect_chain", "failed"],
+      "computed_fields": ["fqdn", "ip", "body_hash", "dedup_key", "responded_at"],
+      "dedup_key_formula": "SHA256('http:' + fqdn + '|' + canonical_url + '|' + method.upper())[:32]",
+      "schema_versions": [
+        {"version": "v1", "detection": "'url' + 'host' present", "migration": null},
+        {"version": "v0", "detection": "'input' field instead of 'host'", "migration": "remap 'input' → 'host'"}
+      ],
+      "quarantine_reason_codes": [
+        "HTTP_MISSING_URL",
+        "HTTP_MISSING_HOST",
+        "HTTP_MISSING_STATUS",
+        "HTTP_INVALID_STATUS",
+        "HTTP_BODY_TOO_LARGE",
+        "HTTP_JSON_PARSE_ERROR",
+        "HTTP_SCHEMA_UNKNOWN"
+      ],
+      "known_quirks": [
+        "body field: absent by default; present if --include-response-body flag used; max 50MB",
+        "content_length: -1 if Transfer-Encoding chunked; treat as unknown; do not quarantine",
+        "failed=true records: ingest as HTTPEndpoint with status_code=null; valid observation",
+        "Port in URL: preserve non-standard port in canonical URL",
+        "Redirect chain: deduplicate against url field to remove self-reference"
+      ],
+      "url_normalization_steps": [
+        "Strip fragment",
+        "Lowercase scheme and host",
+        "Normalize path (resolve .., remove double slashes)",
+        "Sort query parameters alphabetically",
+        "Strip tracking params (utm_source, utm_medium, fbclid, gclid, etc.)"
+      ]
+    },
+    {
+      "parser": "nuclei_parser_v1",
+      "tool": "nuclei",
+      "output_format": "NDJSON",
+      "throughput_target_records_per_hour": 1000,
+      "required_fields": ["template-id", "host", "matched-at", "template.severity", "timestamp"],
+      "optional_fields": ["template.classification.cvss-score", "ip", "extracted-results", "request", "response"],
+      "computed_fields": ["fqdn", "severity_int", "finding_class", "evidence_hash", "dedup_key"],
+      "dedup_key_formula": "SHA256('vuln:' + fqdn + '|' + template_id + '|' + evidence_hash)[:32]",
+      "evidence_hash_formula": "SHA256(matched_at + template_id + (extracted_results joined or ''))[:32]",
+      "schema_versions": [
+        {"version": "v2", "detection": "'template-id' present (hyphenated)", "migration": null},
+        {"version": "v1", "detection": "'templateID' present (camelCase)", "migration": "remap 'templateID' → 'template-id'"}
+      ],
+      "quarantine_reason_codes": [
+        "NUCLEI_MISSING_TEMPLATE_ID",
+        "NUCLEI_MISSING_HOST",
+        "NUCLEI_MISSING_SEVERITY",
+        "NUCLEI_MISSING_TIMESTAMP",
+        "NUCLEI_INVALID_SEVERITY",
+        "NUCLEI_SCHEMA_UNKNOWN",
+        "NUCLEI_JSON_PARSE_ERROR"
+      ],
+      "known_quirks": [
+        "request/response fields: truncate to 4KB; set evidence_truncated=true",
+        "info severity gate: only ingest if KRIL score >= 50; configurable threshold",
+        "Template path vs ID: use template-id not path as canonical identifier",
+        "Missing classification block: set cvss=null, cve_id=null; do not quarantine"
+      ],
+      "finding_class_mapping": {
+        "cve": "vulnerability_cve",
+        "misconfig": "misconfiguration",
+        "exposure": "exposure",
+        "default-login": "default_credential",
+        "injection": "injection",
+        "xss": "injection",
+        "sqli": "injection",
+        "takeover": "takeover",
+        "tech": "technology_disclosure",
+        "default": "unclassified"
+      },
+      "severity_int_mapping": {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+    },
+    {
+      "parser": "katana_parser_v1",
+      "tool": "katana",
+      "output_format": "NDJSON",
+      "throughput_target_records_per_hour": 10000,
+      "required_fields": ["request.endpoint"],
+      "optional_fields": ["request.method", "response.status_code", "response.technologies", "source", "depth"],
+      "computed_fields": ["fqdn", "canonical_url", "source_fqdn", "cross_origin", "dedup_key"],
+      "dedup_key_formula": "SHA256('http:' + fqdn + '|' + canonical_url + '|' + method.upper())[:32]",
+      "schema_versions": [
+        {"version": "v1", "detection": "'request.endpoint' present in nested object", "migration": null},
+        {"version": "v0", "detection": "'url' field at root (no 'request' wrapper)", "migration": "wrap: record['request'] = {'endpoint': record.pop('url'), 'method': 'GET'}"}
+      ],
+      "quarantine_reason_codes": [
+        "KATANA_MISSING_ENDPOINT",
+        "KATANA_INVALID_URL",
+        "KATANA_SCHEMA_UNKNOWN",
+        "KATANA_JSON_PARSE_ERROR"
+      ],
+      "entity_outputs": [
+        "HTTPEndpoint: discovered URL as endpoint node linked to parent Subdomain",
+        "LINKS_TO relationship: cross-page links within same domain",
+        "technologies[]: stored on Subdomain node property"
+      ],
+      "known_quirks": [
+        "Binary content URLs: skip body; still ingest URL as HTTPEndpoint",
+        "Cross-origin links: flag out_of_scope=true; do not ingest as Subdomain",
+        "Duplicate URL discovery: dedup key handles idempotently via MERGE",
+        "JS-rendered URLs: strict query param canonicalization prevents dedup explosion"
+      ]
+    }
+  ],
+
+  "quarantine_protocol": {
+    "record_format_fields": ["quarantine_id", "batch_id", "chunk_id", "parser_name", "schema_version_detected", "quarantine_reason_code", "quarantine_at", "original_record", "original_line"],
+    "storage_location": "artifacts/quarantine/{batch_id}/{chunk_id}.ndjson",
+    "write_mode": "append-only",
+    "retention_days_min": 14,
+    "retention_days_recommended": 30,
+    "ors_signals": [
+      {"signal": "quarantine_events_per_batch", "warning": 100, "critical": null, "action": "WARNING to Mattermost"},
+      {"signal": "quarantine_rate_pct", "warning": null, "critical": 1.0, "action": "CRITICAL; investigate parser"},
+      {"signal": "quarantine_reason_code_new", "warning": null, "critical": "first_occurrence", "action": "ALERT; may indicate tool upgrade"},
+      {"signal": "json_parse_error_rate_pct", "warning": null, "critical": 0.1, "action": "CRITICAL; Oracle output corruption"}
+    ]
+  },
+
+  "schema_migration_policy": {
+    "detection_method": "field_presence_patterns",
+    "migration_principle": "additive_remap_only",
+    "forward_compatibility": "accept_and_ignore_unknown_optional_fields",
+    "version_bump_trigger": "required_field_change_or_semantic_change_only",
+    "migrations": [
+      {"tool": "dnsx", "from_version": "v0", "to_version": "v1", "transform": "record['host'] = record.pop('name')"},
+      {"tool": "httpx", "from_version": "v0", "to_version": "v1", "transform": "record['host'] = record.pop('input')"},
+      {"tool": "nuclei", "from_version": "v1", "to_version": "v2", "transform": "record['template-id'] = record.pop('templateID')"},
+      {"tool": "katana", "from_version": "v0", "to_version": "v1", "transform": "record['request'] = {'endpoint': record.pop('url'), 'method': 'GET'}"}
+    ]
+  },
+
+  "performance_targets": {
+    "dnsx_parse_rate_per_hour": 800000,
+    "httpx_parse_rate_per_hour": 100000,
+    "nuclei_parse_rate_per_hour": 1000,
+    "katana_parse_rate_per_hour": 10000,
+    "max_line_size_bytes": 1048576,
+    "max_record_buffer_mb": 10,
+    "nuclei_response_truncation_bytes": 4096,
+    "parse_memory_model": "streaming_ndjson_line_by_line"
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "Tool upgrade breaks schema silently", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "Version detection catches known transitions; unknown schemas quarantine; ORS alerts on new quarantine reason codes"},
+    {"id": "R2", "title": "Nuclei response body size causes memory spike", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "Truncate to 4KB at parse time; never buffer full body"},
+    {"id": "R3", "title": "URL canonicalization edge cases (IDN, encoded chars)", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Use established URL library; comprehensive test vector suite"},
+    {"id": "R4", "title": "katana JS-rendered URL dedup explosion", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Strict query param canonicalization; session-scoped dedup cache within AWSEM chunk"},
+    {"id": "R5", "title": "High quarantine rate masking systematic parser bug", "severity": "MEDIUM", "probability": "LOW", "mitigation": "ORS alert on quarantine_rate > 1%; first-occurrence alerting for new reason codes"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Implement single shared normalize_fqdn() and canonicalize_url() functions called by all four parsers"},
+    {"priority": 2, "id": "REC-02", "action": "Use streaming NDJSON parse (line-by-line) — never load full file into memory"},
+    {"priority": 3, "id": "REC-03", "action": "Add quarantine_reason_code ORS monitor with first-occurrence alerting for new codes"},
+    {"priority": 4, "id": "REC-04", "action": "Truncate nuclei request/response to 4KB at parse time; store evidence_truncated=true flag"},
+    {"priority": 5, "id": "REC-05", "action": "Gate nuclei info findings by KRIL >= 50; make threshold configurable in parser config"},
+    {"priority": 6, "id": "REC-06", "action": "Run all 4 parser contracts against synthetic malformed inputs as pre-deployment test suite"},
+    {"priority": 7, "id": "REC-07", "action": "Use established URL library (not custom) for canonicalization — IDN and percent-encoding have well-known edge cases"},
+    {"priority": 8, "id": "REC-08", "action": "Set max_line_size_bytes = 1048576 (1MB); quarantine OVERSIZED_RECORD"}
+  ],
+
+  "metrics": {
+    "parser_contracts_defined": 4,
+    "quarantine_reason_codes_total": 24,
+    "schema_migrations_defined": 4,
+    "parser_success_rate_target_min_pct": 99.0,
+    "malformed_quarantine_coverage_target_pct": 100.0,
+    "nuclei_response_truncation_bytes": 4096,
+    "max_line_size_bytes": 1048576,
+    "validation_tests": 10
+  },
+
+  "assumptions": [
+    "A1: All four tools output NDJSON format; no multi-line JSON",
+    "A2: Tool output files are complete before parser starts; atomic file move from temp dir guarantees this",
+    "A3: NDJSON files may be up to 100MB per batch; streaming parse is required",
+    "A4: URL canonicalization library handles IDN correctly",
+    "A5: nuclei template tags are primary source for finding_class; taxonomy may evolve",
+    "A6: katana headless browser JS execution may produce dynamic query params; canonicalization must normalize these",
+    "A7: info severity gate threshold (KRIL >= 50) is configurable; default is conservative"
+  ]
+}
