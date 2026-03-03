@@ -1,0 +1,212 @@
+{
+  "work_order": "WO-00014",
+  "category": "research",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "confidence": 0.89,
+
+  "key_findings": [
+    "Two-stage filter architecture (pre-filter gate → scored evaluation) keeps ≤20% noise target achievable without manual curation; pre-filter should eliminate ≥50% of raw ideas before scoring begins",
+    "Five-dimension scoring model (D1 strategic fit, D2 impact potential, D3 integration risk, D4 ops discipline, D5 evidence quality) each 0–3; composite = (sum/15) × 100 — produces consistent comparable scores across cycles",
+    "Three integration windows (W0 Now, W1 Near 1-3mo, W2 Medium 3-6mo) plus Backlog and Sunset; W0 requires reversibility=HIGH + composite ≥75 to protect against churn in deterministic ops",
+    "Impact hypothesis template (IF/THEN/BECAUSE/cost/reversibility) required for all ideas ≥50 before W1/W0 gate — forces specificity and auditability on all promoted candidates",
+    "Sunset protocol: 3 consecutive cycles with composite <25 → permanent closure; archived not deleted; operator override creates new entry with parent_id reference",
+    "Persistent idea ledger (idea_ledger.json) tracks full cycle history per idea — prevents re-harvesting duplicates and enables trend analysis on scoring drift",
+    "Source registry (source_registry.json) tracks last_harvested date; staleness alert if >35 days — ensures no source silently missed for more than one cycle",
+    "Framework calibration metrics (noise rate, pre-filter hit rate, shortlist size, sunset rate) with defined alert thresholds detect scoring drift before it compounds",
+    "14-day monthly cadence: harvest (D1–3), score (D4–6), noise pass (D7), hypothesis (D8–10), staging (D11–12), report (D13–14) — structured to produce output within single sprint equivalent",
+    "New sources enter registry as active:false and require 1 trial harvest before activation — prevents token waste on untested source quality"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Two-stage filter (pre-filter + scored evaluation) over single-pass scoring",
+      "summary": "Pre-filter gate eliminates structurally disqualifying ideas before scoring begins; scored evaluation handles ambiguous cases with dimensional breakdown",
+      "rationale": "Single-pass scoring wastes evaluator bandwidth on ideas that are obviously disqualified (already implemented, contradicts constraints, no ROI pathway). Pre-filter handles deterministic rejections in O(1) per idea; scoring handles probabilistic evaluation. Separation reduces noise rate without tightening scoring thresholds globally.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Five-dimension scoring model with composite threshold classification",
+      "summary": "D1-D5 each scored 0–3; composite (sum/15)×100; thresholds at 75 (high-confidence), 50 (deferred), 25 (low-priority), below (noise)",
+      "rationale": "A single summary score hides which dimension is failing. Dimension breakdown identifies why an idea is scoring low (e.g., high impact but low evidence quality vs low strategic fit) and guides what evidence would be needed to promote it. Consistent anchors across cycles prevent scoring drift.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "Impact hypothesis required for all ideas ≥50 before staging",
+      "summary": "IF/THEN/BECAUSE template with cost estimate and reversibility rating; no idea enters W0/W1 without completed hypothesis",
+      "rationale": "Unstructured justifications produce adoption decisions that cannot be audited or revoked. The hypothesis forces three disciplines: specificity (what changes), evidence (why expected), reversibility (how to undo). Reversibility is the critical constraint for systems with churn intolerance.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "Sunset protocol: 3-cycle threshold with archived state",
+      "summary": "Ideas with 3 consecutive composite scores <25 are permanently closed; sunset entries archived in ledger with status=sunset; operator override creates new entry (parent_id reference)",
+      "rationale": "Two failure modes avoided: deleting ideas loses institutional memory (did we consider this before?); never sunsetting ideas creates unbounded backlog that dilutes shortlist quality. Three-cycle rule provides statistical confidence that the idea's fit is structural, not timing-based.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Persistent ledger with full cycle history over session-only tracking",
+      "summary": "idea_ledger.json append-only; each cycle adds to cycle_history array per idea; no historical records modified after cycle close",
+      "rationale": "Without cross-cycle tracking, the same idea gets re-harvested and re-scored repeatedly, wasting evaluation bandwidth. The ledger enables: duplicate suppression, trend analysis (is an idea improving over time?), and full audit trail for any adoption or sunset decision.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D6",
+      "title": "New sources enter registry as active:false until trial harvest completes",
+      "summary": "Source activation requires 1 completed trial harvest; prevents untested sources from appearing in shortlist without quality validation",
+      "rationale": "Source quality varies significantly. An untested source might produce 50 raw ideas with 90% pre-filter rejection rate — all evaluation bandwidth wasted. Trial harvest validates source relevance before full inclusion.",
+      "stability_impact": "neutral"
+    }
+  ],
+
+  "scoring_model": {
+    "dimensions": [
+      {"id": "D1", "name": "strategic_fit", "range": "0-3", "description": "Alignment with current Pandavs runtime operations and workflows"},
+      {"id": "D2", "name": "impact_potential", "range": "0-3", "description": "Expected ROI: throughput delta, cost reduction, or coverage expansion"},
+      {"id": "D3", "name": "integration_risk", "range": "0-3", "description": "Risk of implementation: dependency complexity, churn, side effects (0=high risk, 3=near-zero risk)"},
+      {"id": "D4", "name": "ops_discipline_alignment", "range": "0-3", "description": "Compliance with budget discipline, determinism, and integrity constraints"},
+      {"id": "D5", "name": "evidence_quality", "range": "0-3", "description": "Quality of supporting evidence: 0=theoretical, 1=anecdotal, 2=benchmark, 3=production data"}
+    ],
+    "composite_formula": "round(((D1 + D2 + D3 + D4 + D5) / 15) * 100, 1)",
+    "thresholds": [
+      {"min": 75, "max": 100, "classification": "high_confidence", "action": "shortlist immediately; impact hypothesis required; assign to W0 or W1"},
+      {"min": 50, "max": 74, "classification": "deferred", "action": "impact hypothesis required; assign to W1 or W2; 3-month re-evaluation"},
+      {"min": 25, "max": 49, "classification": "low_priority", "action": "log; 6-month re-evaluation; no hypothesis required"},
+      {"min": 0, "max": 24, "classification": "noise", "action": "reject; log in noise registry; increment sunset_count if repeat"}
+    ]
+  },
+
+  "pre_filter_criteria": [
+    {"code": "PF-01", "criterion": "Already implemented in current runtime", "action": "immediate_reject"},
+    {"code": "PF-02", "criterion": "Directly contradicts deterministic or integrity constraints", "action": "immediate_reject"},
+    {"code": "PF-03", "criterion": "Requires external dependency with no documented fallback", "action": "immediate_reject"},
+    {"code": "PF-04", "criterion": "No quantifiable ROI pathway", "action": "immediate_reject"},
+    {"code": "PF-05", "criterion": "Requires irreversible data mutation", "action": "immediate_reject"},
+    {"code": "PF-06", "criterion": "Active sunset status (3 consecutive cycles score <25)", "action": "immediate_reject"}
+  ],
+
+  "integration_windows": [
+    {"id": "W0", "label": "Now", "horizon": "current_cycle", "criteria": "composite ≥75, reversibility=HIGH, ops ready, impact hypothesis complete"},
+    {"id": "W1", "label": "Near-term", "horizon": "1-3 months", "criteria": "composite ≥65, design path clear, effort <1 sprint"},
+    {"id": "W2", "label": "Medium-term", "horizon": "3-6 months", "criteria": "composite ≥50, requires design work before implementation"},
+    {"id": "W3", "label": "Long-term", "horizon": "6-12 months", "criteria": "composite ≥50, premature given current ops priorities"},
+    {"id": "BL", "label": "Backlog", "horizon": "unscheduled", "criteria": "composite ≥50, blocked by external dep or competing priority"},
+    {"id": "SN", "label": "Sunset", "horizon": "closed", "criteria": "3 consecutive monthly cycles with composite <25"}
+  ],
+
+  "monthly_cadence": {
+    "trigger": "First Tuesday of each month",
+    "duration_days": 14,
+    "schedule": [
+      {"days": "1-3", "activity": "harvest", "description": "Scan all active sources; capture raw ideas with source attribution; assign IDEA-YYYYMM-NNN IDs"},
+      {"days": "4-6", "activity": "score", "description": "Apply 5-dimension scoring to all pre-filter survivors"},
+      {"days": "7", "activity": "noise_pass", "description": "Reject ideas scoring <25; document rejection reason in noise registry"},
+      {"days": "8-10", "activity": "hypothesis", "description": "Draft impact hypotheses for all candidates scoring ≥50"},
+      {"days": "11-12", "activity": "staging", "description": "Assign each surviving candidate to integration window (W0-W3/BL)"},
+      {"days": "13-14", "activity": "report", "description": "Generate monthly report; commit to Notion Decision Register + Obsidian"}
+    ]
+  },
+
+  "persistent_artifacts": [
+    {
+      "path": "artifacts/idea-registry/source_registry.json",
+      "purpose": "Tracks all input sources, harvest dates, activation status",
+      "initial_sources": ["EKLAVYA (SRC-001)", "ATLAS (SRC-002)"]
+    },
+    {
+      "path": "artifacts/idea-registry/idea_ledger.json",
+      "purpose": "Persistent cross-cycle idea tracking with scoring history",
+      "operations": ["append new ideas", "update cycle_history per cycle", "update status on adoption/sunset"]
+    },
+    {
+      "path": "artifacts/idea-registry/YYYY-MM-report.md",
+      "purpose": "Monthly report for Notion Decision Register + Obsidian consumption",
+      "frequency": "one per cycle"
+    }
+  ],
+
+  "calibration_metrics": [
+    {"metric": "noise_rate", "target": "≤20%", "alert_condition": ">25% for 2 consecutive cycles", "action": "review pre-filter PF-04 threshold"},
+    {"metric": "high_confidence_candidates", "target": "≥3/cycle", "alert_condition": "<2 for 2 consecutive cycles", "action": "expand source coverage; check D5 scoring calibration"},
+    {"metric": "pre_filter_hit_rate", "target": "≥50% of raw ideas", "alert_condition": "<30% hit rate", "action": "harvest targeting wrong source areas; refocus review scope"},
+    {"metric": "candidate_shortlist_size", "target": "≥10", "alert_condition": "<8", "action": "add new active source to registry"},
+    {"metric": "sunset_rate", "target": "<10%/cycle", "alert_condition": ">20%/cycle", "action": "review D2/D3 weights; system may be over-penalizing integration risk"},
+    {"metric": "hypothesis_completeness", "target": "100% of ≥50 ideas", "alert_condition": "<90%", "action": "execution gap; prioritize hypothesis drafting before staging decisions"},
+    {"metric": "source_staleness_days", "target": "≤35 days", "alert_condition": ">35 days any source", "action": "alert; schedule emergency harvest for stale source"}
+  ],
+
+  "sunset_protocol": {
+    "trigger_cycles": 3,
+    "trigger_threshold": 25,
+    "action": "status → sunset; archived in ledger; never re-evaluated unless operator override",
+    "operator_override": "creates new ledger entry with parent_id reference; original sunset record unmodified"
+  },
+
+  "impact_hypothesis_template": {
+    "required_for": "composite_score >= 50",
+    "fields": [
+      "idea_id",
+      "idea_description",
+      "source_id",
+      "if_we_integrate",
+      "then_we_expect",
+      "because",
+      "integration_cost_estimate",
+      "reversibility",
+      "confidence",
+      "re_evaluation_trigger"
+    ]
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "Idea churn exceeds ops stability threshold", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "W0 gate requires reversibility=HIGH + score ≥75; design review required before W0 promotion"},
+    {"id": "R2", "title": "Pre-filter over-tuned; good ideas rejected early", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Track pre-filter hit rate; quarterly calibration review of PF criteria"},
+    {"id": "R3", "title": "Harvest misses high-value source updates", "severity": "MEDIUM", "probability": "LOW", "mitigation": "source_staleness_days ORS-equivalent alert if >35 days"},
+    {"id": "R4", "title": "Impact hypotheses written but never acted on", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "W0 items auto-prompt implementation ticket creation in Notion Decision Register"},
+    {"id": "R5", "title": "Scoring inconsistency across cycles (drift)", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Publish D1-D5 anchor examples; re-score sample idea each cycle for calibration check"},
+    {"id": "R6", "title": "Token waste on low-quality new sources", "severity": "LOW", "probability": "MEDIUM", "mitigation": "New sources enter as active:false; 1 trial harvest required before activation"},
+    {"id": "R7", "title": "Ledger grows unbounded over years", "severity": "LOW", "probability": "LOW", "mitigation": "Sunset entries archived annually; default ledger queries filter to status=active"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Create artifacts/idea-registry/source_registry.json with EKLAVYA (SRC-001) and ATLAS (SRC-002) as initial active sources"},
+    {"priority": 2, "id": "REC-02", "action": "Create artifacts/idea-registry/idea_ledger.json with empty ideas:[] array — establishes persistent state before first harvest"},
+    {"priority": 3, "id": "REC-03", "action": "Run first harvest immediately (days 1-3 of cadence) — establishes baseline shortlist and calibrates pre-filter against actual source content"},
+    {"priority": 4, "id": "REC-04", "action": "Enforce impact hypothesis for every idea ≥50 before W1/W0 gate — prevents unspecified ideas from entering ops backlog"},
+    {"priority": 5, "id": "REC-05", "action": "Set Notion Decision Register template to accept staging map directly from monthly report — prevents copy-paste errors"},
+    {"priority": 6, "id": "REC-06", "action": "Review pre-filter hit rate after first 3 cycles — calibrate PF-04 (ROI pathway) based on actual rejection pattern"},
+    {"priority": 7, "id": "REC-07", "action": "Add source_staleness_days alert for any source exceeding 35 days without harvest — prevents silent source drift"},
+    {"priority": 8, "id": "REC-08", "action": "Quarterly framework review: inspect sunset rate, noise rate trend, D5 score distribution — identifies systematic scoring bias"}
+  ],
+
+  "metrics": {
+    "scoring_dimensions": 5,
+    "pre_filter_criteria": 6,
+    "integration_windows": 6,
+    "monthly_cadence_days": 14,
+    "minimum_shortlist_candidates": 10,
+    "minimum_high_confidence_candidates": 3,
+    "max_noise_rate_pct": 20,
+    "sunset_trigger_cycles": 3,
+    "sunset_trigger_threshold_score": 25,
+    "source_staleness_alert_days": 35,
+    "hypothesis_required_threshold": 50,
+    "w0_minimum_score": 75,
+    "w1_minimum_score": 65,
+    "w2_minimum_score": 50
+  },
+
+  "assumptions": [
+    "A1: EKLAVYA and ATLAS produce at minimum 5–15 new or updated ideas per monthly cycle",
+    "A2: Pre-filter eliminates ≥50% of raw harvested ideas using structural criteria before scoring",
+    "A3: D1–D5 dimension anchors are calibrated to Pandavs runtime strategic fit definition",
+    "A4: Notion Decision Register and Obsidian are writable at month-end for report delivery",
+    "A5: Adopted W0 ideas tracked via separate WO or ticket system; outside this framework scope",
+    "A6: Source content accessible within harvest window (days 1–3); access issues flagged as framework alerts",
+    "A7: Ledger schema is append-only; no historical scoring data modified after cycle closes"
+  ]
+}
