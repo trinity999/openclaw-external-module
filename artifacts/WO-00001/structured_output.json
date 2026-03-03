@@ -1,0 +1,214 @@
+{
+  "work_order": "WO-00001",
+  "category": "architecture",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.91,
+
+  "key_findings": [
+    "Five-lane pipeline architecture (DNS → HTTP → Enrich → Ingest → Validate) provides clean isolation and independent failure domains",
+    "Dedup key contracts are the single highest-risk contract surface; must be locked before first production write",
+    "Write-ahead checkpointing + MERGE semantics + ReplacingMergeTree achieves full idempotency across both datastores",
+    "Day-1 concurrency envelopes (DNS:250, HTTP:75, Enrich:25, Ingest:15) are conservative but provably stable; throughput is tunable post-validation",
+    "Token-bucket backpressure prevents Controller ingest saturation from Oracle scan outpacing",
+    "KRIL-weighted queue prioritization ensures highest-value intelligence surfaces before full pipeline completion",
+    "Oracle node is a single point of failure; checkpoint replayability mitigates data loss risk but not throughput continuity"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Queue-per-lane partitioning",
+      "summary": "Five independent AWSEM queue partitions, one per lane, each with DLQ",
+      "rationale": "Decouples lanes with different throughput profiles; enables independent concurrency tuning",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Dedup key contracts",
+      "summary": "SHA-256 composite keys for DNS, HTTP, graph nodes, graph edges; ClickHouse ReplacingMergeTree composite sort key",
+      "rationale": "Deterministic, collision-resistant, stable across replays",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D3",
+      "title": "Idempotency via MERGE + ReplacingMergeTree",
+      "summary": "Neo4j MERGE ON CREATE/MATCH; ClickHouse RMT with Redis Bloom filter for real-time pre-write dedup",
+      "rationale": "Guarantees safe replay at any lane boundary; eliminates destructive overwrite risk",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D4",
+      "title": "Write-ahead batch checkpoints",
+      "summary": "Checkpoint written before datastore write, per 5k/2k/500-item batch by lane",
+      "rationale": "Ensures deterministic replay from last confirmed state; achieves ≤10 min RTO",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Conservative Day-1 concurrency envelopes",
+      "summary": "DNS:250, HTTP:75, Enrich:25, Ingest:15 Neo4j tx, ClickHouse batch every 10s or 5k rows",
+      "rationale": "Stability-first; benchmark under real load before expansion",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D6",
+      "title": "Token-bucket backpressure with high/low water marks",
+      "summary": "Controller suspends Oracle task issuance when result queue exceeds high-water mark; resumes at 50% low-water mark",
+      "rationale": "Prevents Controller ingest saturation; decouples scan throughput from ingest capacity",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D7",
+      "title": "Lane sequencing contract",
+      "summary": "Lane N+1 activates for a batch only after Lane N checkpoint is confirmed",
+      "rationale": "Eliminates DNS/HTTP linking race conditions; enforces graph integrity at edge creation time",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D8",
+      "title": "ORS reflex monitor integration",
+      "summary": "Five telemetry signals per lane with defined warning/critical thresholds and automated reflexes",
+      "rationale": "Reduces operator response time; enables autonomous stability management within defined envelopes",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D9",
+      "title": "KRIL-weighted queue prioritization",
+      "summary": "Subdomains sorted by KRIL rank within DNS batches; HTTP/Enrich queues filter by KRIL threshold",
+      "rationale": "Maximizes intelligence yield per unit of pipeline time; high-value findings surface early",
+      "stability_impact": "neutral"
+    },
+    {
+      "id": "D10",
+      "title": "Model escalation rate cap at 5%",
+      "summary": "ORS arbitrates premium model use; escalation only when anomaly score >0.75 AND confidence <0.6",
+      "rationale": "Cost discipline; prevents runaway escalation under high-noise scan conditions",
+      "stability_impact": "neutral"
+    }
+  ],
+
+  "dedup_key_contracts": {
+    "dns_record": "sha256('{subdomain}|{record_type}|{value}|{ttl_bucket}') where ttl_bucket = floor(ttl/300)*300",
+    "http_result": "sha256('{subdomain}|{port}|{status_code}|{body_hash_prefix_64}')",
+    "neo4j_node": "lowercase_strip('{subdomain}')",
+    "neo4j_edge": "'{source_node}|{edge_type}|{target_node}'",
+    "clickhouse_row": "ReplacingMergeTree ORDER BY (subdomain, scan_type, toStartOfHour(scan_ts))"
+  },
+
+  "concurrency_envelopes": {
+    "dns_lane_oracle": 250,
+    "http_lane_oracle": 75,
+    "enrich_lane_oracle": 25,
+    "ingest_lane_neo4j_tx": 15,
+    "clickhouse_batch_interval_sec": 10,
+    "clickhouse_batch_size_rows": 5000,
+    "validate_lane_controller": 3
+  },
+
+  "backpressure_thresholds": {
+    "dns_result_queue_high_water": 50000,
+    "http_result_queue_high_water": 20000,
+    "enrich_result_queue_high_water": 5000,
+    "resume_at_fraction_of_high_water": 0.5
+  },
+
+  "checkpoint_config": {
+    "dns_batch_size": 5000,
+    "http_batch_size": 2000,
+    "enrich_batch_size": 500,
+    "store": "sqlite_wal_or_redis_sorted_set",
+    "record_format": "{lane}:{batch_id}:{offset}:{status}:{ts}",
+    "write_order": "before_datastore_write"
+  },
+
+  "ors_thresholds": [
+    {"signal": "queue_depth_pct_high_water", "warning": 0.70, "critical": 0.95, "reflex_warning": "log_alert", "reflex_critical": "suspend_new_tasks"},
+    {"signal": "lane_error_rate_per_batch", "warning": 0.01, "critical": 0.02, "reflex_warning": "log", "reflex_critical": "pause_lane_alert"},
+    {"signal": "ingest_batch_duration_min", "warning": 15, "critical": 30, "reflex_warning": "reduce_concurrency", "reflex_critical": "halt_alert"},
+    {"signal": "neo4j_write_latency_p95_ms", "warning": 500, "critical": 2000, "reflex_warning": "reduce_batch_size", "reflex_critical": "pause_ingest"},
+    {"signal": "clickhouse_insert_queue_rows", "warning": 100000, "critical": 500000, "reflex_warning": "increase_flush_freq", "reflex_critical": "pause_ingest"},
+    {"signal": "oracle_heartbeat_absence_sec", "warning": 30, "critical": 120, "reflex_warning": "alert", "reflex_critical": "suspend_lane"}
+  ],
+
+  "failure_model": [
+    {"class": "transient", "example": "dns_timeout_http_reset", "max_retries": 3, "backoff_sec": [1, 5, 15], "escalation": "dlq_after_max_retries"},
+    {"class": "rate_limited", "example": "http_429_dns_servfail_burst", "max_retries": 2, "cooldown_sec": 60, "concurrency_reduction_pct": 20},
+    {"class": "datastore_error", "example": "neo4j_timeout_ch_insert_fail", "max_retries": 2, "escalation": "dlq_quarantine"},
+    {"class": "integrity_error", "example": "dedup_key_collision_content_mismatch", "max_retries": 0, "escalation": "halt_lane_ors_review"},
+    {"class": "node_unavailable", "example": "oracle_unreachable", "max_retries": 0, "escalation": "pause_lane_ors_alert_heartbeat_resume"},
+    {"class": "corruption_risk", "example": "source_file_hash_mismatch", "max_retries": 0, "escalation": "halt_ingest_forensic_log_manual_intervention"}
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "Oracle SPOF", "severity": "high", "probability": "medium", "mitigation": "ORS heartbeat monitoring, checkpoint replayability, future second worker"},
+    {"id": "R2", "title": "ClickHouse dedup lag", "severity": "medium", "probability": "high", "mitigation": "FINAL keyword in validation queries, Redis Bloom filter pre-insertion"},
+    {"id": "R3", "title": "Neo4j memory pressure at scale", "severity": "medium", "probability": "medium", "mitigation": "Pre-configure heap >= 8GB, page cache >= 16GB, batched MERGE writes of 500 ops/tx"},
+    {"id": "R4", "title": "DNS/HTTP linking race condition", "severity": "high", "probability": "low_medium", "mitigation": "Lane sequencing contract enforced at AWSEM batch issuance"},
+    {"id": "R5", "title": "Dedup key false dedup via collision", "severity": "high", "probability": "low", "mitigation": "SHA-256 keys, test corpus validation, collision audit in validation lane"},
+    {"id": "R6", "title": "Controller ingest saturation", "severity": "medium", "probability": "medium", "mitigation": "Token-bucket backpressure, ClickHouse bulk insert, Neo4j batch size tuning"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "R1", "action": "Lock and commit dedup key contracts to protocols/DEDUP_KEY_CONTRACT.md before first write"},
+    {"priority": 2, "id": "R2", "action": "Implement and test write-ahead checkpoint logic with synthetic replay test before production activation"},
+    {"priority": 3, "id": "R3", "action": "Apply Neo4j schema constraints and indexes: CREATE CONSTRAINT subdomain_name_unique IF NOT EXISTS FOR (n:Subdomain) REQUIRE n.name IS UNIQUE"},
+    {"priority": 4, "id": "R4", "action": "Run DNS lane only for first 24–48 hours; gate HTTP lane activation on validation pass (error <=2%, dupe <=0.5%, link correctness >=99.5%)"},
+    {"priority": 5, "id": "R5", "action": "Activate and validate ORS reflex monitors before enabling Oracle scan execution at production concurrency"},
+    {"priority": 6, "id": "R6", "action": "Deploy Redis Bloom filter on Controller; warm with existing known subdomains pre-ingest"},
+    {"priority": 7, "id": "R7", "action": "Post Day-1 stabilization: benchmark concurrency envelopes; step DNS from 250 to 350 to 500 with ORS monitoring"},
+    {"priority": 8, "id": "R8", "action": "Implement ClickHouse materialized views for real-time ORS health dashboard metrics"},
+    {"priority": 9, "id": "R9", "action": "Define AWSEM per-lane SLA contracts with maximum batch processing time thresholds"}
+  ],
+
+  "throughput_projections": {
+    "dns_lane": {
+      "concurrency": 250,
+      "estimated_resolutions_per_hour": 900000,
+      "estimated_hours_for_10M": 11.1,
+      "estimated_dns_positives": "2.5M–4M"
+    },
+    "http_lane": {
+      "concurrency": 75,
+      "estimated_probes_per_hour": 60000,
+      "estimated_http_targets": "1.5M–3M",
+      "estimated_hours": "25–50"
+    },
+    "enrich_lane": {
+      "concurrency": 25,
+      "estimated_candidates": "150k–600k",
+      "estimated_hours": "15–60"
+    }
+  },
+
+  "metrics": {
+    "throughput_dns_per_hour_target": 500000,
+    "throughput_http_per_hour_target": 50000,
+    "throughput_ingest_per_hour_target": 200000,
+    "integrity_score_target": 0.995,
+    "duplicate_write_rate_max": 0.005,
+    "lane_error_rate_max": 0.02,
+    "checkpoint_rto_minutes_max": 10,
+    "neo4j_write_latency_p95_ms_max": 500,
+    "model_escalation_rate_max": 0.05
+  },
+
+  "implementation_phases": [
+    {"phase": 1, "name": "Foundation", "status": "pending", "actions": ["Commit dedup key contracts", "Neo4j schema constraints", "ClickHouse table schemas", "Checkpoint store deployment", "Redis Bloom filter", "AWSEM queue partitions", "ORS monitor configuration", "Synthetic replay validation"]},
+    {"phase": 2, "name": "DNS Lane Activation", "status": "pending", "actions": ["Load subdomain dataset KRIL-sorted", "Enable Oracle dnsx at 250 concurrent", "Ingest DNS results", "Validation lane DNS integrity check", "24–48h monitoring gate"]},
+    {"phase": 3, "name": "HTTP Lane Activation", "status": "pending", "actions": ["Build HTTP queue from DNS positives", "KRIL re-rank HTTP candidates", "Enable Oracle httpx at 75 concurrent", "Validate Neo4j edge creation"]},
+    {"phase": 4, "name": "Enrichment Lane Activation", "status": "pending", "actions": ["ECE candidate selection", "Enable Oracle nuclei/katana at 25 concurrent", "Enrichment evidence nodes in Neo4j", "ClickHouse temporal correlation"]},
+    {"phase": 5, "name": "Scale Tuning", "status": "pending", "actions": ["Concurrency benchmarking per lane", "AWSEM SLA enforcement activation", "Incremental envelope expansion", "Second worker node preparation"]}
+  ],
+
+  "assumptions": [
+    "Oracle worker: >= 32 CPU cores, >= 64GB RAM",
+    "Controller VPS: >= 16GB RAM, >= 8 CPU cores",
+    "AWSEM supports per-partition queue depth monitoring and backpressure signals",
+    "Neo4j is standalone (not cluster); single-node write path",
+    "ClickHouse is on Controller node or accessible with < 10ms network latency",
+    "Redis is available on Controller for Bloom filter and cache",
+    "Subdomain dataset files are pre-deduplicated at source",
+    "ORS has API surface for threshold configuration and Mattermost/webhook alert emission"
+  ]
+}
