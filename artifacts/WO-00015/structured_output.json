@@ -1,0 +1,177 @@
+{
+  "work_order": "WO-00015",
+  "category": "analysis",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "confidence": 0.91,
+
+  "key_findings": [
+    "Three independent failure modes require three distinct detection mechanisms: schema failures (per-record streaming check), loss signatures (window-close count reconciliation), and continuity gaps (periodic heartbeat tick); unified approach misses window-level failures",
+    "Count reconciliation for loss detection (count_in - count_out - count_dlq - count_schema_quarantine) is schema-free and O(1) per window; avoids end-to-end trace which requires correlation ID injection at every record",
+    "Per-record schema check uses adaptive sampling: 100% for first 100 records per window, 10% thereafter; auto-escalates to 100% if quarantine rate exceeds 1% — caps CPU cost while catching schema bombs early",
+    "DLQ settle delay: read DLQ count at window_close + 5s to allow in-flight records to settle before loss_rate computation; prevents false loss detection during high-throughput bursts",
+    "Heartbeat-based continuity check (last_seen_ts comparison) requires zero schema changes; sequence numbering approach rejected for requiring monotonic ID injection at lane entry",
+    "Validator self-monitoring via self-heartbeat to ORS: VALIDATOR_DOWN alert if heartbeat absent for 2× interval — prevents silent validator failure",
+    "Fault injection suite: 7 fault types (missing field, type mismatch, silent loss, lane stall, DLQ flood, schema version change, window drift) — 100% detection required for CI gate",
+    "Hot-reloadable validator_config.json: all thresholds reload without restart; config_version stored with each alert for audit provenance"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Streaming per-record schema check over batch validation",
+      "summary": "Schema check on every record (with sampling policy) rather than at window close",
+      "rationale": "Batch check at 60s window close allows 11,640 DNS records (194/sec × 60s) to be ingested with a schema regression before detection. Per-record streaming check detects on record 1. Sampling policy caps CPU to manageable levels while preserving fast detection.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Count reconciliation for loss detection over end-to-end tracing",
+      "summary": "Loss computed as count_in - count_out - count_dlq - count_schema_quarantine at window close",
+      "rationale": "End-to-end tracing requires correlation ID injection into every record schema — a breaking change. Count reconciliation is schema-free, O(1) per window, and naturally idempotent on replay.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "Heartbeat-based continuity check over sequence numbering",
+      "summary": "Continuity detected via last_seen_ts comparison against timeout threshold; no monotonic ID required",
+      "rationale": "Sequence numbering requires stateful ID injection at lane entry — a coordination point and schema change. Heartbeat needs only a timestamp register, is resilient to record reordering, and requires zero schema changes.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "Adaptive sampling policy (100% first 100, 10% thereafter, auto-escalate)",
+      "summary": "First 100 records per window always validated; thereafter 10% sample; escalate to 100% on quarantine spike",
+      "rationale": "100% sampling at 700k/hr (194 records/sec) would require 194 schema checks/sec. 10% reduces to 19/sec — within latency budget. First-100 rule catches schema regressions at window open. Auto-escalation on quarantine spike catches mid-window failures.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Self-heartbeat emitted to ORS for validator liveness monitoring",
+      "summary": "Validator emits VALIDATOR_HEARTBEAT every heartbeat_check_interval_sec; ORS alerts on absence",
+      "rationale": "A validator that fails silently is worse than no validator (false sense of security). Self-heartbeat ensures the monitoring system itself is monitored.",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "check_modules": [
+    {
+      "id": "module_a",
+      "name": "Schema Conformity Check",
+      "trigger": "per-record, streaming",
+      "sampling": {"first_n_full": 100, "thereafter_pct": 10, "escalation_quarantine_rate": 0.01},
+      "checks": ["required_field_presence", "field_type", "value_range", "schema_version"],
+      "alert_trigger": "window_quarantine_rate > max_schema_fail_rate (default 0.02)",
+      "action_on_fail": "quarantine(reason_code) + decrement count_out + increment count_schema_quarantine"
+    },
+    {
+      "id": "module_b",
+      "name": "Loss Signature Check",
+      "trigger": "per-window, at window close + 5s settle delay",
+      "formula": "loss_rate = (count_in - count_out - count_dlq - count_schema_quarantine) / count_in",
+      "thresholds": [
+        {"condition": "loss_rate > 0.01", "severity": "MEDIUM", "reflex": "log + alert"},
+        {"condition": "loss_rate > 0.05", "severity": "HIGH", "reflex": "lane_pause + alert"},
+        {"condition": "dlq_depth > 50", "severity": "MEDIUM", "reflex": "dlq_drain"}
+      ]
+    },
+    {
+      "id": "module_c",
+      "name": "Continuity Gap Check",
+      "trigger": "periodic tick every heartbeat_check_interval_sec (default 30s)",
+      "checks": [
+        {"name": "lane_heartbeat", "condition": "now - last_seen_ts > multiplier × expected_interval_sec", "severity": "HIGH", "reflex": "LANE_STALL alert"},
+        {"name": "window_duration_drift", "condition": "actual_window_duration > 1.5 × target_window_duration_sec", "severity": "MEDIUM", "reflex": "WINDOW_DRIFT alert"},
+        {"name": "pipeline_gap", "condition": "HTTP window complete without DNS predecessor in lookback", "severity": "HIGH", "reflex": "PIPELINE_GAP alert + batch_replay trigger"}
+      ],
+      "heartbeat_defaults": {
+        "dns": {"expected_interval_sec": 5, "heartbeat_multiplier": 2.0, "timeout_sec": 10},
+        "http": {"expected_interval_sec": 10, "heartbeat_multiplier": 2.0, "timeout_sec": 20},
+        "enrich": {"expected_interval_sec": 30, "heartbeat_multiplier": 2.0, "timeout_sec": 60}
+      }
+    }
+  ],
+
+  "alert_schema": {
+    "fields": ["alert_id", "lane", "check_module", "severity", "window_id", "metrics", "triggered_at", "auto_reflex"],
+    "severity_levels": ["critical", "high", "medium", "low"],
+    "auto_reflexes": ["none", "dlq_drain", "lane_pause", "batch_replay", "escalate_sampling"]
+  },
+
+  "ors_reflex_map": [
+    {"alert_type": "SCHEMA_FAIL_RATE", "reflex": "escalate_sampling", "escalation": "manual after 3 consecutive windows"},
+    {"alert_type": "SILENT_LOSS_LOW", "reflex": "log + alert", "escalation": "manual after 2 consecutive windows"},
+    {"alert_type": "SILENT_LOSS_HIGH", "reflex": "lane_pause + alert", "escalation": "require manual restart"},
+    {"alert_type": "DLQ_DEPTH_EXCEEDED", "reflex": "dlq_drain", "escalation": "alert if drain fails within 2 windows"},
+    {"alert_type": "LANE_STALL", "reflex": "alert + wait 1 cycle", "escalation": "critical if stall persists"},
+    {"alert_type": "WINDOW_DRIFT", "reflex": "log + metric record", "escalation": "alert if >2x for 2 consecutive windows"},
+    {"alert_type": "PIPELINE_GAP", "reflex": "alert + batch_replay trigger", "escalation": "critical if spans >1 full cycle"},
+    {"alert_type": "VALIDATOR_DOWN", "reflex": "critical alert to ops", "escalation": "immediate manual intervention"}
+  ],
+
+  "fault_injection_suite": [
+    {"fault_type": "missing_required_field", "method": "omit fqdn from DNS record", "expected_module": "module_a", "expected_detection_window": "record 1 (100% sample zone)"},
+    {"fault_type": "type_mismatch", "method": "set status_code to string", "expected_module": "module_a", "expected_detection_window": "within first 100 records"},
+    {"fault_type": "silent_loss", "method": "dispatch record, discard before output, not DLQ", "expected_module": "module_b", "expected_detection_window": "window close"},
+    {"fault_type": "lane_stall", "method": "halt record production for 2x heartbeat timeout", "expected_module": "module_c", "expected_detection_window": "within 2 heartbeat ticks"},
+    {"fault_type": "dlq_flood", "method": "write 60 records to DLQ in one window", "expected_module": "module_b", "expected_detection_window": "window close"},
+    {"fault_type": "schema_version_change", "method": "inject v0-format record into v1-schema lane", "expected_module": "module_a", "expected_detection_window": "within 100 records; sampling escalation triggered"},
+    {"fault_type": "window_drift", "method": "slow window completion to 2x target duration", "expected_module": "module_c", "expected_detection_window": "within 2 heartbeat ticks"}
+  ],
+
+  "configuration": {
+    "file": "validator_config.json",
+    "hot_reloadable": true,
+    "config_version_stored_with_alert": true,
+    "reload_latency_target_sec": 5,
+    "per_lane_fields": ["schema_contract", "required_fields", "window_size_sec", "max_schema_fail_rate", "max_loss_rate", "dlq_depth_alert_threshold", "expected_interval_sec", "heartbeat_timeout_multiplier", "heartbeat_check_interval_sec", "sampling_policy"]
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "DLQ read before settle produces inflated loss_rate", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "5s settle delay after window close before DLQ count read"},
+    {"id": "R2", "title": "Schema false alarms during tool version rollout", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Schema version detection + grace period for first 100 records of v0→v1 transition"},
+    {"id": "R3", "title": "High CPU from 100% schema check at 700k/hr", "severity": "MEDIUM", "probability": "LOW", "mitigation": "10% sampling after first 100; escalate only on quarantine spike"},
+    {"id": "R4", "title": "Heartbeat false alarm during scheduled maintenance", "severity": "LOW", "probability": "MEDIUM", "mitigation": "MAINTENANCE_WINDOW_START signal from ORS suppresses Module C alerts"},
+    {"id": "R5", "title": "Validator self-failure undetected", "severity": "HIGH", "probability": "LOW", "mitigation": "Self-heartbeat to ORS; VALIDATOR_DOWN alert if heartbeat absent for 2x interval"},
+    {"id": "R6", "title": "count_in/count_out drift under replay", "severity": "LOW", "probability": "MEDIUM", "mitigation": "Replay increments count_out only; count_in is immutable per original dispatch"},
+    {"id": "R7", "title": "Config change produces alert storm", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Config version stored with alert; ops correlates alert spike to config change timestamp"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Implement count_in counter in controller dispatch path — required for Module B loss reconciliation"},
+    {"priority": 2, "id": "REC-02", "action": "Deploy Module A first (schema check) — immediate value; required fields + type validation on DNS records alone catches most regressions"},
+    {"priority": 3, "id": "REC-03", "action": "Set DLQ settle delay to 5s in Module B — prevents false loss alarms on high-throughput bursts"},
+    {"priority": 4, "id": "REC-04", "action": "Configure validator self-heartbeat to ORS from day 1 — ensures monitoring system is itself monitored"},
+    {"priority": 5, "id": "REC-05", "action": "Run fault injection suite before production promotion — gate on >=95% recall across all 7 fault types"},
+    {"priority": 6, "id": "REC-06", "action": "Add MAINTENANCE_WINDOW_START signal to ORS protocol — prevents heartbeat false alarms during planned downtime"},
+    {"priority": 7, "id": "REC-07", "action": "Hot-reload validator_config.json on file change — enables threshold tuning without restart"},
+    {"priority": 8, "id": "REC-08", "action": "Monitor validator execution latency as ORS signal — alert if schema_check_latency p95 > 50ms or window_close_check > 5s"}
+  ],
+
+  "metrics": {
+    "check_modules": 3,
+    "fault_types_in_injection_suite": 7,
+    "detection_recall_target_pct": 95,
+    "false_alarm_rate_target_pct": 5,
+    "validation_latency_target_sec": 60,
+    "schema_check_latency_target_ms": 50,
+    "window_size_default_sec": 60,
+    "heartbeat_check_interval_sec": 30,
+    "dlq_settle_delay_sec": 5,
+    "sampling_first_n_full": 100,
+    "sampling_thereafter_pct": 10,
+    "max_schema_fail_rate_default": 0.02,
+    "max_loss_rate_low_threshold": 0.01,
+    "max_loss_rate_high_threshold": 0.05,
+    "dlq_depth_alert_default": 50
+  },
+
+  "assumptions": [
+    "A1: Controller maintains count_in counter per dispatch — required for loss reconciliation",
+    "A2: DLQ is readable within 5s of record arrival (settle delay assumption)",
+    "A3: ORS signal bus available as alert emission target; accepts structured JSON",
+    "A4: Maintenance window signals sent by ORS before planned downtime",
+    "A5: Tool parser schema contracts (dnsx_v1, httpx_v1, nuclei_v1, katana_v1) are stable reference",
+    "A6: validator_config.json hot-reload via inotify or polling (<=5s reload latency)"
+  ]
+}
