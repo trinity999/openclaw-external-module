@@ -1,0 +1,234 @@
+{
+  "work_order": "WO-00012",
+  "category": "analysis",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.90,
+
+  "key_findings": [
+    "Two user roles defined (Analyst, Leadership) with distinct view models — Leadership needs aggregate KPIs and SLO compliance; Analyst needs row-level filtering, graph drilldowns, and finding triage",
+    "Six views designed: Asset Discovery, Asset Detail, Finding Triage, Attack Surface Map (graph), HTTP Endpoint Browser, Operations Log, Executive Summary — all core journeys ≤ 5 clicks validated",
+    "Operations Log should be built first — immediately useful for 72h operation monitoring; lowest implementation complexity; highest immediate operational value",
+    "Attack Surface Map (graph) deferred to Phase 3 — highest complexity (requires graph rendering library); REST API table views sufficient for Phase 1-2 analyst intelligence consumption",
+    "URL-encoded filter state (shareable filter URLs) enables analyst collaboration via Mattermost — pre-filtered views shareable across team without screenshots",
+    "Graph view capped at 500 nodes (KRIL-prioritized display) — graph rendering with 10k+ nodes is unusable in browser; cap with visible count notice preserves most valuable attack surface view",
+    "AND-only filter combination chosen over OR — OR filters with 10+ dimensions create counterintuitive results and query performance issues; AND is the safe conservative default",
+    "Filter response time targets: ≤ 1s single-dimension, ≤ 3s complex multi-filter — requires Neo4j indexes on kril_score/severity/template_id and ClickHouse materialized views",
+    "Pivot map designed with max 3 hops from any entry point — analyst can navigate from finding → asset → graph without losing context or exceeding click budget",
+    "Interesting preset filters for HTTP Endpoint Browser: 'Juicy Endpoints' (200/401/403 + JSON), 'Admin Panels' (title contains admin), 'Dynamic Content' — accelerate analyst pattern recognition"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Separate Analyst and Leadership roles with distinct view models",
+      "summary": "Analyst: 5 operational views with row-level filtering. Leadership: 2 summary views with aggregate KPIs and export only.",
+      "rationale": "A single view trying to serve both roles is cluttered for both. Leadership needs SLO compliance percentages; analysts need per-row drilldowns. Separate view models allow each role to operate without noise.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Operations Log built first",
+      "summary": "Operations Log (Phase 1) → Asset Discovery + Asset Detail (Phase 1) → Finding Triage + Template Detail (Phase 2) → Graph View (Phase 3)",
+      "rationale": "Operations Log delivers immediate value for 72h operation monitoring and requires only /api/v1/stats/ endpoints. Building it first provides visibility before analyst views are complete.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "Graph view 500 node cap with KRIL prioritization",
+      "summary": "Attack Surface Map displays max 500 nodes; if corpus exceeds, top 500 by KRIL score shown with visible count notice",
+      "rationale": "Graph rendering with 10k+ nodes causes browser performance collapse. 500 nodes covers the most valuable attack surface. KRIL prioritization ensures highest-value nodes are visible.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "URL-encoded shareable filter state",
+      "summary": "Active filter state encoded in URL query parameters; links are shareable via Mattermost for analyst collaboration",
+      "rationale": "Session-only filter state is not shareable. Analysts need to share pre-filtered views in Mattermost (e.g., 'look at these critical findings on this domain'). URL encoding is the standard mechanism.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "AND-only filter combination",
+      "summary": "All filters combined with AND semantics; no OR option in initial implementation",
+      "rationale": "OR filters with 10+ dimensions create counterintuitive result sets and query planning complexity. AND is the analyst's natural filter intent ('show me assets that are KRIL > 70 AND resolved AND have findings').",
+      "stability_impact": "neutral"
+    },
+    {
+      "id": "D6",
+      "title": "Tech stack decision deferred to WO-00013",
+      "summary": "Information architecture is technology-agnostic; all views defined as data models and user journeys",
+      "rationale": "Frontend tech stack selection has distinct tradeoffs (hosting cost, dev familiarity, SSR vs CSR, etc.) that require separate analysis. Mixing stack decision into IA design creates coupling.",
+      "stability_impact": "neutral"
+    }
+  ],
+
+  "views": [
+    {
+      "id": "V1",
+      "name": "Asset Discovery",
+      "role": "analyst",
+      "priority_order": 2,
+      "purpose": "Primary workspace for identifying high-value targets",
+      "default_sort": "kril_score DESC",
+      "columns": ["fqdn", "kril_score", "resolved", "a_records", "http_positive", "findings_count", "critical_findings_count", "first_seen", "last_seen"],
+      "filters": ["resolution_status", "http_positive", "kril_score_range", "has_findings", "finding_severity", "root_domain", "first_seen_range", "last_seen_range", "ip_address"],
+      "pivots": ["Asset Detail (click FQDN)", "IP Detail (click IP)", "Finding Triage (click finding count)", "Asset Discovery filtered by domain (click root domain)"],
+      "api_backend": "/api/v1/subdomains"
+    },
+    {
+      "id": "V1a",
+      "name": "Asset Detail",
+      "role": "analyst",
+      "priority_order": 2,
+      "purpose": "Full detail for a single subdomain",
+      "sections": ["metadata_bar", "ip_addresses", "http_endpoints", "findings", "graph_preview", "cname_chain", "technologies"],
+      "pivots": ["IP Detail", "Finding Detail", "Graph View"],
+      "api_backend": "/api/v1/subdomains/{fqdn}"
+    },
+    {
+      "id": "V2",
+      "name": "Finding Triage",
+      "role": "analyst",
+      "priority_order": 4,
+      "purpose": "Prioritize and review vulnerability findings across full corpus",
+      "default_sort": "severity DESC, kril_score DESC",
+      "columns": ["fqdn", "template_id", "severity", "finding_class", "cvss", "kril_score", "confirmed_at", "evidence_preview"],
+      "filters": ["severity", "finding_class", "template_id_search", "kril_score_range", "fqdn_search", "root_domain", "confirmed_after", "confirmed_before"],
+      "pivots": ["Asset Detail (click FQDN)", "Template Detail (click template ID)"],
+      "api_backend": "/api/v1/findings"
+    },
+    {
+      "id": "V2a",
+      "name": "Template Detail",
+      "role": "analyst",
+      "priority_order": 4,
+      "purpose": "All assets affected by a specific vulnerability template",
+      "sections": ["template_header", "affected_assets_table", "confirmed_at_timeline", "export_button"],
+      "export_formats": ["csv"],
+      "api_backend": "/api/v1/findings?template_id={template_id}"
+    },
+    {
+      "id": "V3",
+      "name": "Attack Surface Map",
+      "role": "analyst",
+      "priority_order": 7,
+      "purpose": "Graph visualization of entity relationships",
+      "entry_points": ["FQDN search", "Asset Detail 'View in Graph' button", "IP search"],
+      "depth_options": [1, 2, 3],
+      "default_depth": 1,
+      "max_nodes": 500,
+      "node_priority": "kril_score DESC",
+      "node_types": ["Subdomain", "IPAddress", "Finding"],
+      "edge_types": ["RESOLVES_TO", "LINKS_TO", "SAN_PEER", "HAS_FINDING"],
+      "api_backend": "/api/v1/graph/neighbors"
+    },
+    {
+      "id": "V4",
+      "name": "HTTP Endpoint Browser",
+      "role": "analyst",
+      "priority_order": 8,
+      "purpose": "Review discovered HTTP endpoints; identify interesting response patterns",
+      "default_sort": "first_seen DESC",
+      "columns": ["url", "fqdn", "status_code", "content_type", "title", "content_length", "dynamic_content", "first_seen"],
+      "filters": ["status_code", "content_type", "fqdn_search", "root_domain", "has_title", "dynamic_content", "kril_score_range"],
+      "preset_filters": [
+        {"name": "Juicy Endpoints", "definition": "status_code IN (200, 401, 403) AND content_type = application/json"},
+        {"name": "Admin Panels", "definition": "title CONTAINS 'admin' OR title CONTAINS 'dashboard' (case-insensitive)"},
+        {"name": "Dynamic Content", "definition": "dynamic_content = true"}
+      ],
+      "pivots": ["Asset Detail (click FQDN)"],
+      "api_backend": "/api/v1/subdomains/{fqdn}/endpoints"
+    },
+    {
+      "id": "V5",
+      "name": "Operations Log",
+      "role": ["analyst", "leadership"],
+      "priority_order": 1,
+      "purpose": "Live operational monitoring of scan throughput, SLO status, and alerts",
+      "sections": ["throughput_panel", "slo_status_panel", "phase_status", "recent_alerts", "active_dlq_items"],
+      "refresh_interval_sec": 30,
+      "refresh_slo_max_sec": 60,
+      "api_backend": ["/api/v1/stats/summary", "/api/v1/stats/throughput"]
+    },
+    {
+      "id": "V6",
+      "name": "Executive Summary",
+      "role": "leadership",
+      "priority_order": 6,
+      "purpose": "One-page operation health for leadership; aggregate KPIs; no drilldown",
+      "sections": ["operation_summary", "corpus_progress", "findings_summary", "slo_compliance", "export_button"],
+      "refresh_interval_sec": 60,
+      "export_formats": ["pdf", "csv"],
+      "api_backend": ["/api/v1/stats/summary", "/api/v1/findings?severity=critical"]
+    }
+  ],
+
+  "user_journeys": [
+    {"journey": "Find critical findings on high-KRIL assets", "steps": 4, "within_5_clicks": true},
+    {"journey": "Identify all assets resolving to a specific IP", "steps": 2, "within_5_clicks": true},
+    {"journey": "Find all assets vulnerable to a specific CVE", "steps": 3, "within_5_clicks": true},
+    {"journey": "Export critical findings CSV for bug bounty submission", "steps": 4, "within_5_clicks": true},
+    {"journey": "Explore attack surface neighbors of a target", "steps": 5, "within_5_clicks": true},
+    {"journey": "Check operation status", "steps": 1, "within_5_clicks": true},
+    {"journey": "Leadership: get finding count summary", "steps": 1, "within_5_clicks": true}
+  ],
+
+  "filter_taxonomy": {
+    "combination_logic": "AND",
+    "state_persistence": "url_encoded_query_params",
+    "clear_all": "one_click",
+    "performance_targets": {
+      "single_dimension_filter_max_sec": 1,
+      "complex_multi_filter_max_sec": 3
+    },
+    "required_indexes": ["kril_score", "severity", "template_id", "fqdn", "status_code", "finding_class"]
+  },
+
+  "build_phases": [
+    {"phase": 1, "views": ["Operations Log", "Asset Discovery", "Asset Detail"], "rationale": "Immediate operational value; lowest complexity"},
+    {"phase": 2, "views": ["Finding Triage", "Template Detail", "Executive Summary"], "rationale": "Core analyst intelligence; moderate complexity"},
+    {"phase": 3, "views": ["Attack Surface Map", "HTTP Endpoint Browser"], "rationale": "Highest complexity; requires graph rendering library"}
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "Graph view unusable at high node count", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "500 node cap; KRIL-prioritized display; visible count notice"},
+    {"id": "R2", "title": "Filter query latency with complex multi-filter", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Pre-indexed Neo4j properties; ClickHouse materialized views; ≤3s SLO"},
+    {"id": "R3", "title": "Frontend over-complexity scope creep", "severity": "MEDIUM", "probability": "HIGH", "mitigation": "Strict phase ordering; no graph view until Phase 3; no additions before Phase 1 ships"},
+    {"id": "R4", "title": "Summary refresh delay > 60s", "severity": "LOW", "probability": "LOW", "mitigation": "Operations Log backed by ClickHouse materialized view; 30s auto-refresh"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Build Operations Log first — immediately useful for 72h operation monitoring"},
+    {"priority": 2, "id": "REC-02", "action": "Implement shareable filter URLs from day 1 — enables analyst collaboration via Mattermost"},
+    {"priority": 3, "id": "REC-03", "action": "Add interesting preset filters to HTTP Endpoint Browser (Juicy Endpoints, Admin Panels, Dynamic Content)"},
+    {"priority": 4, "id": "REC-04", "action": "Enforce 500 node cap in graph view with KRIL-based prioritization and visible count notice"},
+    {"priority": 5, "id": "REC-05", "action": "Add Export CSV to Finding Triage and Template Detail views for bug bounty submission workflow"},
+    {"priority": 6, "id": "REC-06", "action": "Implement persistent filter state within session with one-click Clear All Filters"},
+    {"priority": 7, "id": "REC-07", "action": "Defer graph visualization to Phase 3; REST API table views sufficient for Phase 1-2"},
+    {"priority": 8, "id": "REC-08", "action": "Tech stack decision delegated to WO-00013; this IA design is technology-agnostic"}
+  ],
+
+  "metrics": {
+    "views_defined": 8,
+    "user_roles": 2,
+    "user_journeys_validated": 7,
+    "journeys_within_5_clicks": 7,
+    "max_pivot_depth_hops": 3,
+    "graph_node_cap": 500,
+    "operations_log_refresh_sec": 30,
+    "operations_log_slo_max_sec": 60,
+    "filter_single_dimension_max_sec": 1,
+    "filter_complex_multi_max_sec": 3,
+    "build_phases": 3
+  },
+
+  "assumptions": [
+    "A1: REST API endpoints are available as the data backend for all views",
+    "A2: Neo4j indexes on kril_score, severity, template_id are applied before frontend query load",
+    "A3: ClickHouse materialized views provide aggregate stats without full-table scans",
+    "A4: Frontend tech stack TBD in WO-00013; this design is framework-agnostic",
+    "A5: Authentication and role-based access control deferred to v1.1 (internal network only for v1)",
+    "A6: Mattermost available for analyst collaboration via shareable filter URLs"
+  ]
+}
