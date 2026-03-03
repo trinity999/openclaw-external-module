@@ -1,0 +1,203 @@
+{
+  "work_order": "WO-00011",
+  "category": "architecture",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.91,
+
+  "key_findings": [
+    "Three independent scores designed: KRIL (0-100, asset strategic value), Asset Risk Score (0-100, vulnerability severity density), Bounty Potential Score (0-100, submission ROI) — single composite score rejected as insufficient for multi-use-case needs",
+    "KRIL is forward-looking (how worth scanning is this asset?) — Risk Score is backward-looking (how dangerous is this asset confirmed to be?) — Bounty Potential is ROI-focused (which finding to submit?) — distinct queries require distinct scores",
+    "All three scores are explainability-first — signal component values stored on Neo4j Subdomain node alongside final score; analyst can inspect why a score is high without re-running scorer",
+    "All weights externalized to score_config.json (hot-reloadable); ML model rejected in favor of weighted sum — ML requires labeled training data, is not explainable without SHAP, cannot be hot-adjusted without retraining",
+    "Scoring pipeline is async/pipelined (not inline) — scoring of batch N runs concurrently with scanning of batch N+1; achieves ≤ 10% effective overhead vs 77% overhead if inline",
+    "KRIL drives AWSEM queue reordering: HTTP queue ordered by KRIL desc after each DNS batch; Enrich queue ordered by bounty_potential desc after each HTTP batch",
+    "Top-decile precision validation: ≥ 35% of all findings expected in top 10% of assets by KRIL score → ≥ 25% precision uplift vs naive ordering",
+    "Enrich KRIL threshold (default: 50) gates which targets receive nuclei/katana enrichment — low-KRIL targets skip expensive enrichment; threshold configurable in score_config.json",
+    "Bounty potential score is per-finding (not per-asset) — analyst needs to know which specific finding to submit; asset-level aggregation (max across findings) is secondary convenience",
+    "score_config.json must be versioned; config_version stored alongside each computed score for auditability — weight changes produce score discontinuities that need traceable provenance"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Three independent scores (KRIL, risk, bounty)",
+      "summary": "Three separate scores for distinct use cases: queue prioritization (KRIL), remediation priority (risk), bug bounty submission (bounty potential)",
+      "rationale": "A single composite score cannot be tuned for different use cases simultaneously. KRIL prioritizes scanning resources; risk prioritizes remediation; bounty potential prioritizes submission. Separate scores are independently queryable and independently configurable.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Weighted sum with externalized config over ML model",
+      "summary": "All scores computed as weighted sums of structured signals; weights in score_config.json; hot-reloadable without controller restart",
+      "rationale": "ML models require labeled training data (which findings led to accepted bounties), are opaque without SHAP wrappers, and cannot be hot-adjusted without retraining. Weighted sums are fully explainable, immediately deployable, and threshold-adjustable in seconds.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "Pipelined async scoring (not inline)",
+      "summary": "Scoring of batch N runs asynchronously concurrent with scanning of batch N+1; effective overhead ≤ 10% vs 77% if inline",
+      "rationale": "Inline scoring blocks the scan hot path. At 700k DNS/hr, batch = 52s. KRIL computation for 10k targets at 50/T2-call × 200ms = 40s — 77% overhead inline. Async pipeline overlaps scoring and scanning, reducing effective overhead to ≤ 10%.",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D4",
+      "title": "Explainability fields stored on Neo4j node",
+      "summary": "Signal component values stored as kril_signals{}, risk_signals{}, bounty_signals{} alongside score on Subdomain node",
+      "rationale": "Analysts seeing KRIL = 74 need to understand why. Explainability stored on node makes reasoning inspectable in Asset Detail view without re-running scorer. Required for analyst trust in automated prioritization.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Bounty potential computed per-finding, aggregated per-asset",
+      "summary": "bounty_potential_score computed for each Finding node; Subdomain node stores MAX across its findings as subdomain-level bounty score",
+      "rationale": "Bug bounty submissions are per-finding. Analyst needs to know which specific finding to submit, not just which asset. Per-finding score preserves this resolution; asset-level max is a navigation convenience.",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "scoring_model": {
+    "kril_score": {
+      "range": "0-100",
+      "purpose": "Asset strategic reconnaissance value (forward-looking)",
+      "signals": [
+        {"name": "http_positive", "weight": 0.30, "formula": "1.0 if http_responded else 0.0"},
+        {"name": "status_interesting", "weight": 0.20, "formula": "1.0 if status in {200,301,302,401,403} else 0.5 if 500-599 else 0.0"},
+        {"name": "finding_density", "weight": 0.25, "formula": "min(1.0, sum(finding_count × severity_weight) / 10)"},
+        {"name": "link_complexity", "weight": 0.10, "formula": "min(1.0, unique_outbound_links / 20)"},
+        {"name": "recency_bonus", "weight": 0.15, "formula": "1.0 if last_scanned < 24h else max(0.0, 1.0 - days_since_scan / 7)"}
+      ],
+      "finding_density_severity_weights": {"critical": 4.0, "high": 2.0, "medium": 1.0, "low": 0.5, "info": 0.1},
+      "final_formula": "round((sum of signal × weight) × 100, 1)",
+      "explainability_fields": ["kril_score", "kril_signals{}", "kril_computed_at"],
+      "computation_trigger": "After each DNS batch completes",
+      "write_back_target": "Subdomain node property kril_score"
+    },
+    "asset_risk_score": {
+      "range": "0-100",
+      "purpose": "Confirmed vulnerability severity density (backward-looking)",
+      "signals": [
+        {"name": "severity_weighted_count", "weight": 0.60, "formula": "min(1.0, sum(finding_count × sev_weight) / 20)"},
+        {"name": "ip_diversity_factor", "weight": 0.20, "formula": "min(1.0, unique_ip_count / 5)"},
+        {"name": "critical_presence", "weight": 0.20, "formula": "1.0 if any critical finding else 0.0"}
+      ],
+      "severity_weights": {"critical": 8.0, "high": 4.0, "medium": 2.0, "low": 1.0, "info": 0.0},
+      "final_formula": "round((sum of signal × weight) × 100, 1)",
+      "explainability_fields": ["asset_risk_score", "risk_signals{}", "finding_breakdown{}", "risk_computed_at"],
+      "computation_trigger": "After each Enrich batch completes for target",
+      "write_back_target": "Subdomain node property asset_risk_score"
+    },
+    "bounty_potential_score": {
+      "range": "0-100",
+      "purpose": "Bug bounty submission ROI estimate",
+      "granularity": "per-finding; Subdomain stores MAX across its findings",
+      "signals": [
+        {"name": "finding_severity_tier", "weight": 0.40, "formula": "critical=1.0, high=0.7, medium=0.4, low=0.1, info=0.0"},
+        {"name": "finding_class_premium", "weight": 0.30, "formula": "see class_premium_table"},
+        {"name": "kril_score_factor", "weight": 0.20, "formula": "kril_score / 100"},
+        {"name": "uniqueness_factor", "weight": 0.10, "formula": "1.0 if first occurrence of template on target else 0.5"}
+      ],
+      "class_premium_table": {
+        "injection": 1.0,
+        "takeover": 0.9,
+        "vulnerability_cve": 0.85,
+        "default_credential": 0.8,
+        "misconfiguration": 0.6,
+        "exposure": 0.5,
+        "technology_disclosure": 0.1,
+        "unclassified": 0.3
+      },
+      "final_formula": "round((sum of signal × weight) × 100, 1) per finding; Subdomain.bounty_potential_score = MAX across findings",
+      "explainability_fields": ["bounty_potential_score", "bounty_signals{}", "top_finding_id", "bounty_computed_at"],
+      "computation_trigger": "After each Enrich batch completes",
+      "write_back_target": "Finding node property bounty_potential_score + Subdomain node property bounty_potential_score"
+    }
+  },
+
+  "queue_prioritization": {
+    "dns_queue": {
+      "initial_ordering": "Root domain intelligence + alphabetical",
+      "reordering_trigger": "N/A (no KRIL available pre-DNS)"
+    },
+    "http_queue": {
+      "ordering": "kril_score DESC",
+      "reordering_trigger": "After each KRIL computation (post DNS batch)",
+      "minimum_kril_to_enqueue": 0
+    },
+    "enrich_queue": {
+      "ordering": "bounty_potential_score DESC, kril_score DESC",
+      "reordering_trigger": "After each bounty potential computation (post HTTP batch)",
+      "minimum_kril_to_enqueue": 50
+    }
+  },
+
+  "scoring_pipeline": {
+    "model": "async_pipelined",
+    "description": "Scoring of batch N runs concurrently with scanning of batch N+1",
+    "effective_overhead_pct": 10,
+    "inline_overhead_pct_rejected": 77,
+    "latency_targets": {
+      "kril_computation_max_min": 5,
+      "risk_score_update_max_min": 1,
+      "bounty_score_update_max_min": 1,
+      "neo4j_writeback_max_sec": 30,
+      "clickhouse_telemetry_max_sec": 30
+    }
+  },
+
+  "score_config": {
+    "file": "score_config.json",
+    "hot_reloadable": true,
+    "versioned": true,
+    "config_version_stored_with_score": true,
+    "reload_latency_target_sec": 5,
+    "fields": ["kril_weights", "risk_weights", "bounty_weights", "kril_recency_decay_days", "kril_finding_density_max", "enrich_kril_threshold", "kril_info_gate_threshold"]
+  },
+
+  "top_decile_validation": {
+    "method": "After first full scan cycle, rank all subdomains by KRIL score; count findings in top 10% vs bottom 90%",
+    "target_top_decile_finding_share_pct": 35,
+    "precision_uplift_vs_naive_target_pct": 25,
+    "validation_frequency": "After each full DNS+HTTP+Enrich cycle completion"
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "KRIL stale under rapid scan expansion", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Recency_bonus decays KRIL for unscanned assets; ORS alert on kril_age > 24h"},
+    {"id": "R2", "title": "Top-decile precision below 25% uplift", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Validate after first full cycle; adjust signal weights in score_config.json"},
+    {"id": "R3", "title": "Scoring pipeline latency exceeds 10% overhead", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Pipeline scoring is async; overlap with next batch; monitor kril_computation_latency_sec as ORS signal"},
+    {"id": "R4", "title": "score_config changes produce score discontinuity without provenance", "severity": "LOW", "probability": "MEDIUM", "mitigation": "Version score_config.json; store config_version alongside each computed score"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Externalize all weights to score_config.json; hot-reloadable without controller restart"},
+    {"priority": 2, "id": "REC-02", "action": "Store explainability JSON with every score in Neo4j — analyst-inspectable reasoning"},
+    {"priority": 3, "id": "REC-03", "action": "Run pipelined async scoring (batch N scoring concurrent with batch N+1 scanning)"},
+    {"priority": 4, "id": "REC-04", "action": "Validate top-decile precision after first full scan cycle; target >= 35% of findings in top 10%"},
+    {"priority": 5, "id": "REC-05", "action": "Version score_config.json; store config_version with each computed score"},
+    {"priority": 6, "id": "REC-06", "action": "Monitor kril_computation_latency_sec as ORS signal; alert if > batch_cycle_time"},
+    {"priority": 7, "id": "REC-07", "action": "Use KRIL score as Enrich queue primary sort; bounty_potential as secondary sort"},
+    {"priority": 8, "id": "REC-08", "action": "Set enrich_kril_threshold = 50 (configurable); only enrich targets above threshold"}
+  ],
+
+  "metrics": {
+    "score_dimensions": 3,
+    "kril_signal_count": 5,
+    "risk_score_signal_count": 3,
+    "bounty_score_signal_count": 4,
+    "top_decile_finding_share_target_pct": 35,
+    "precision_uplift_target_pct": 25,
+    "scoring_overhead_target_max_pct": 10,
+    "explainability_coverage_pct": 100,
+    "neo4j_writeback_latency_max_sec": 30,
+    "config_reload_latency_max_sec": 5
+  },
+
+  "assumptions": [
+    "A1: KRIL computation runs as T2 batch (50 targets per call); total time proportional to batch count",
+    "A2: Neo4j supports arbitrary JSON property storage for explainability fields on Subdomain nodes",
+    "A3: score_config.json hot-reload does not require controller process restart",
+    "A4: Bounty program config (scope rules, reward tiers) optional; model produces proxy signals without it",
+    "A5: Top-decile precision uplift measured after first complete DNS+HTTP+Enrich cycle, not on partial data",
+    "A6: Info-severity findings excluded from risk score computation (info does not contribute to risk)"
+  ]
+}
