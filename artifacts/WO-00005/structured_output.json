@@ -1,0 +1,195 @@
+{
+  "work_order": "WO-00005",
+  "category": "research",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-03T00:00:00Z",
+  "confidence": 0.87,
+
+  "key_findings": [
+    "TLS SAN expansion (T1) is the highest immediate coverage gain at lowest complexity — httpx already supports certificate extraction; SAN parsing is Controller-side; activates with HTTP lane",
+    "Nuclei template auto-selection (T2) yields 60-80% enrichment scan time reduction through HTTP fingerprinting; Oracle enrichment capacity freed for DNS/HTTP lanes",
+    "Passive DNS overlay (T3) is zero-risk coverage expansion for inactive subdomains; activates before first DNS batch via API integration only; no Oracle impact",
+    "Dynamic KRIL re-ranking (T4) improves time-to-insight by 30-50% through live signal boost of sibling subdomains; requires AWSEM priority-update hook",
+    "Graph-driven next-hop discovery (T5) is Day-3+ technique requiring populated Neo4j graph; highest intelligence density per scan slot; scheduled Neo4j pattern queries off-peak",
+    "T1 + T2 combined exceed the 30% throughput target alone; remaining techniques add coverage depth and sequencing quality",
+    "All five techniques are independently rollbackable via config flag; no restart required; zero integrity regression risk under normal operation",
+    "Parallelization is safe for T1+T3 (Day 1 simultaneous); T2+T4 (Day 2-3 simultaneous); T5 depends on T1/T3 graph population"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Portfolio ordered by deployment readiness, not ROI",
+      "summary": "T3 and T1 deploy Day 1 (lowest complexity); T2 and T4 deploy Day 2-3; T5 deploys Day 3+",
+      "rationale": "Immediate gain from low-complexity techniques avoids risk of deploying multiple medium/high complexity changes simultaneously; staged rollout preserves rollback clarity",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Universal fallback for T2 fingerprint misses",
+      "summary": "Targets with fingerprint confidence < 0.80 run universal template subset (~400 of ~2000 templates)",
+      "rationale": "Targeted template selection fails gracefully; universal fallback preserves detection rate for misclassified targets; false negative rate bounded",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "T4 boost cooldown at 30 minutes minimum",
+      "summary": "Any subdomain that receives a KRIL boost cannot receive another boost for 30 minutes",
+      "rationale": "Prevents re-ranking feedback loop; debounce ensures queue stability under repeated signal triggers from same target cluster",
+      "stability_impact": "critical"
+    },
+    {
+      "id": "D4",
+      "title": "T5 triggers at 3M+ graph nodes or 72h mark",
+      "summary": "Graph-driven queries scheduled only when Neo4j contains >= 3M nodes or at 72h mark, whichever comes first",
+      "rationale": "Below 3M nodes, pattern query candidate yield is too sparse to justify query latency; graph density threshold ensures meaningful results",
+      "stability_impact": "neutral"
+    },
+    {
+      "id": "D5",
+      "title": "T3 PDNS queries async and non-blocking",
+      "summary": "PDNS API queries dispatched async before batch; DNS batch does not wait for PDNS response",
+      "rationale": "PDNS API latency is unpredictable; blocking DNS dispatch on PDNS response would stall the most critical pipeline lane",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "technique_portfolio": [
+    {
+      "rank": 1,
+      "id": "T1",
+      "name": "TLS SAN Subdomain Expansion",
+      "category": "coverage_expansion",
+      "deploy_phase": "Day 1 — HTTP lane activation",
+      "complexity": "LOW",
+      "expected_coverage_gain_pct": "15-30",
+      "expected_throughput_gain_pct": "0 (queue reuse)",
+      "oracle_impact": "none",
+      "rollback_flag": "httpx_tls_san_extraction_enabled",
+      "rollback_trigger": "dns_queue_high_water_mark_exceeded AND san_dedup_rate_lt_50pct",
+      "productivity_metric": "san_dns_positive_rate >= 0.15",
+      "kril_integration": "new SAN candidates scored at median priority"
+    },
+    {
+      "rank": 2,
+      "id": "T2",
+      "name": "Nuclei Template Auto-Selection from HTTP Fingerprint",
+      "category": "throughput_acceleration",
+      "deploy_phase": "Day 2-3 — sprint build required",
+      "complexity": "MEDIUM",
+      "expected_coverage_gain_pct": "0 (neutral)",
+      "expected_enrichment_time_reduction_pct": "60-80",
+      "oracle_impact": "high_positive — frees 60-80% enrichment capacity",
+      "rollback_flag": "nuclei_template_auto_selection_enabled",
+      "rollback_trigger": "findings_per_hour_drop_gt_15pct vs baseline",
+      "productivity_metric": "templates_executed_per_target <= 400",
+      "universal_fallback_confidence_threshold": 0.80
+    },
+    {
+      "rank": 3,
+      "id": "T3",
+      "name": "Passive DNS Overlay",
+      "category": "coverage_expansion",
+      "deploy_phase": "Day 1 — before first DNS batch",
+      "complexity": "LOW",
+      "expected_coverage_gain_pct": "20-40 (inactive subdomains)",
+      "expected_throughput_gain_pct": "20 (Oracle DNS freed)",
+      "oracle_impact": "positive — reduces active DNS scan load",
+      "rollback_flag": "pdns_overlay_enabled",
+      "rollback_trigger": "pdns_api_error_rate_gt_5pct",
+      "productivity_metric": "pdns_hit_rate >= 0.20",
+      "async_mode": true,
+      "stale_data_filter_months": 12
+    },
+    {
+      "rank": 4,
+      "id": "T4",
+      "name": "Dynamic KRIL Re-Ranking on Live Signal",
+      "category": "sequencing_optimization",
+      "deploy_phase": "Day 2-3 — requires AWSEM re-ordering hook",
+      "complexity": "MEDIUM",
+      "expected_time_to_insight_improvement_pct": "30-50",
+      "oracle_impact": "neutral",
+      "rollback_flag": "dynamic_kril_reranking_enabled",
+      "rollback_trigger": "awsem_queue_reorder_rate_thrash OR feedback_loop_detected",
+      "boost_cooldown_min": 30,
+      "boost_signals": [
+        {"signal": "resolves_to_sensitive_ip_range", "boost_pts": 20},
+        {"signal": "http_admin_panel_detected", "boost_pts": 25},
+        {"signal": "tls_san_shared_infra", "boost_pts": 15},
+        {"signal": "nuclei_critical_high_finding", "boost_pts": 30},
+        {"signal": "cname_unclaimed_cloud", "boost_pts": 50}
+      ],
+      "productivity_metric": "time_to_first_high_value_finding reduced >= 0.25"
+    },
+    {
+      "rank": 5,
+      "id": "T5",
+      "name": "Graph-Driven Next-Hop Discovery",
+      "category": "corpus_expansion",
+      "deploy_phase": "Day 3+ or >= 3M graph nodes",
+      "complexity": "HIGH",
+      "expected_novel_target_discovery_pct": "15-30",
+      "oracle_impact": "neutral (new candidates enter existing DNS lane)",
+      "rollback_flag": "graph_next_hop_queries_enabled",
+      "rollback_trigger": "neo4j_query_latency_p95_gt_60s OR candidate_yield_lt_10",
+      "schedule_interval_hours": 4,
+      "graph_node_threshold": 3000000,
+      "productivity_metric": "next_hop_dns_positive_rate >= 0.10",
+      "neo4j_queries": [
+        "co_hosted_subdomain_discovery",
+        "cname_chain_expansion",
+        "certificate_co_issuance_discovery"
+      ]
+    }
+  ],
+
+  "rollout_sequence": {
+    "day_1": ["T3_passive_dns", "T1_tls_san"],
+    "day_2_3": ["T2_template_selection", "T4_dynamic_kril"],
+    "day_3_plus": ["T5_graph_next_hop"],
+    "parallel_safe": [["T1", "T3"], ["T2", "T4"]],
+    "sequential_dependency": "T5 depends on T1+T3 graph population"
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "T1 DNS queue spike from SAN candidates", "severity": "medium", "probability": "medium", "mitigation": "Bloom filter dedup; SAN candidate rate-limited to 10k/hr; existing ORS backpressure"},
+    {"id": "R2", "title": "T2 fingerprint misclassification causes missed findings", "severity": "medium", "probability": "medium", "mitigation": "Universal fallback for confidence < 0.80; detection rate ORS monitor"},
+    {"id": "R3", "title": "T3 PDNS API rate limit disrupts batch timing", "severity": "low", "probability": "high", "mitigation": "Async non-blocking PDNS queries; DNS batch not blocked"},
+    {"id": "R4", "title": "T4 dynamic re-ranking feedback loop", "severity": "high", "probability": "low", "mitigation": "30-min boost cooldown; ORS monitor for queue reorder rate"},
+    {"id": "R5", "title": "T5 Neo4j query latency blocks Controller", "severity": "medium", "probability": "medium", "mitigation": "60s timeout; async non-blocking; scheduled off-peak"},
+    {"id": "R6", "title": "Combined queue depth exceeds capacity", "severity": "medium", "probability": "low", "mitigation": "All techniques share existing AWSEM infrastructure; cumulative backpressure already modeled"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Activate T3 (Passive DNS) before first DNS batch — API integration only, zero risk"},
+    {"priority": 2, "id": "REC-02", "action": "Activate T1 (TLS SAN) with HTTP lane — enable httpx TLS flag + implement SAN parser at Controller"},
+    {"priority": 3, "id": "REC-03", "action": "Build fingerprint-to-nuclei-template mapping table for T2 in next sprint"},
+    {"priority": 4, "id": "REC-04", "action": "Add ORS signals for T1/T3 productivity metrics to Mattermost OPS channel"},
+    {"priority": 5, "id": "REC-05", "action": "Implement T4 after T1/T3 stabilize; requires AWSEM priority-update hook"},
+    {"priority": 6, "id": "REC-06", "action": "Schedule T5 graph queries every 4h starting when Neo4j >= 3M nodes"},
+    {"priority": 7, "id": "REC-07", "action": "Add per-technique rollback config flag; single-line disable; no restart required"}
+  ],
+
+  "metrics": {
+    "throughput_increase_min_pct": 30,
+    "duplicate_mismatch_max_pct": 0.005,
+    "premium_model_usage_max_pct": 0.05,
+    "incident_mttr_max_min": 20,
+    "san_dns_positive_rate_min": 0.15,
+    "templates_per_target_max": 400,
+    "pdns_hit_rate_min": 0.20,
+    "time_to_insight_improvement_min_pct": 25,
+    "next_hop_dns_positive_rate_min": 0.10
+  },
+
+  "assumptions": [
+    "A1: httpx supports --tls-grab or equivalent TLS certificate extraction in JSON output",
+    "A2: At least one PDNS API is accessible from Controller with acceptable rate limits",
+    "A3: Nuclei template library organized with technology-specific subdirectories enabling subset selection",
+    "A4: AWSEM supports priority-update on queued items without dequeue/re-enqueue",
+    "A5: Neo4j has indexed properties for pattern query fields (scanned, kril_rank_pct, relationship types)",
+    "A6: Bloom filter capacity has >= 20% headroom over current 10M baseline for SAN candidates",
+    "A7: KRIL scoring callable in-process at Controller without full re-scan"
+  ]
+}
