@@ -101,9 +101,13 @@
       "id": "WO-00009",
       "category": "delegated",
       "priority": "high",
-      "state": "awaiting_analysis",
+      "state": "completed",
       "created_at": "2026-03-03T15:43:50Z",
-      "enrichment": "WOEP_v1_applied"
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-03T17:00:11Z",
+      "artifact_report": "artifacts/WO-00009/report.md",
+      "artifact_structured": "artifacts/WO-00009/structured_output.json",
+      "confidence": "pending_ingestion_review"
     },
     {
       "id": "WO-00010",
