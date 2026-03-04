@@ -1,0 +1,178 @@
+{
+  "work_order": "WO-00023",
+  "version": "1.0",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "description": "Error classification taxonomy for outbox sweep retry decisions. Each entry maps an error signal (substring or exception class) to a retry class and handling action.",
+  "retry_classes": {
+    "RETRYABLE": {
+      "description": "Transient error. Same payload will succeed on retry after backoff.",
+      "action": "Increment retry_count. Set next_retry_at with exponential backoff. Status = FAILED.",
+      "backoff_policy": "base_s=60, multiplier=2, max_s=3600 (60s, 120s, 240s, 480s, 960s)"
+    },
+    "NON_RETRYABLE": {
+      "description": "Payload or schema error. Retrying will always fail. Escalate immediately to dead letter.",
+      "action": "Status = DEAD_LETTER. Write to dead_letter_events. No retry."
+    },
+    "ALREADY_SYNCED": {
+      "description": "Sink already contains this event (idempotent replay). Not a failure.",
+      "action": "Status = SYNCED. Write ledger entry with delivery_attempt > 1."
+    },
+    "UNKNOWN": {
+      "description": "Error not matched by any rule. Treat as RETRYABLE with max 2 extra attempts before DLQ.",
+      "action": "Treat as RETRYABLE but max_retries reduced to 2 for this class."
+    }
+  },
+  "rules": {
+    "clickhouse": [
+      {
+        "id": "CH-R01",
+        "error_signals": ["Connection refused", "ConnectionRefused", "socket.timeout", "ConnectionError", "Network is unreachable"],
+        "class": "RETRYABLE",
+        "description": "ClickHouse server unreachable — transient network or restart"
+      },
+      {
+        "id": "CH-R02",
+        "error_signals": ["Timeout", "timeout", "deadline exceeded", "timed out"],
+        "class": "RETRYABLE",
+        "description": "Query timeout — server overloaded, retry after backoff"
+      },
+      {
+        "id": "CH-R03",
+        "error_signals": ["TOO_MANY_PARTS", "Too many parts", "429"],
+        "class": "RETRYABLE",
+        "description": "ClickHouse merge throttling — back off, let compaction complete"
+      },
+      {
+        "id": "CH-R04",
+        "error_signals": ["MEMORY_LIMIT_EXCEEDED", "memory limit"],
+        "class": "RETRYABLE",
+        "description": "Server memory pressure — retry with smaller batch"
+      },
+      {
+        "id": "CH-R05",
+        "error_signals": ["TABLE_IS_DROPPED", "UNKNOWN_TABLE"],
+        "class": "NON_RETRYABLE",
+        "description": "Target table does not exist — schema mismatch, requires operator intervention"
+      },
+      {
+        "id": "CH-R06",
+        "error_signals": ["BAD_ARGUMENTS", "TYPE_MISMATCH", "CANNOT_PARSE_DATETIME", "CANNOT_CONVERT_TYPE", "ILLEGAL_TYPE_OF_ARGUMENT"],
+        "class": "NON_RETRYABLE",
+        "description": "Payload type or format mismatch — payload is malformed, retry will not help"
+      },
+      {
+        "id": "CH-R07",
+        "error_signals": ["Authentication failed", "AUTHENTICATION_FAILED", "Access denied", "Forbidden"],
+        "class": "NON_RETRYABLE",
+        "description": "Credentials or permission error — requires operator fix before any events can be delivered"
+      },
+      {
+        "id": "CH-R08",
+        "error_signals": ["UNIQUE_VIOLATION", "duplicate", "Duplicate entry", "already exists"],
+        "class": "ALREADY_SYNCED",
+        "description": "Row already present in ClickHouse — treat as successful idempotent delivery"
+      },
+      {
+        "id": "CH-R09",
+        "error_signals": ["DB_ENGINE_REQUIRED", "UNKNOWN_DATABASE"],
+        "class": "NON_RETRYABLE",
+        "description": "Database does not exist — configuration error"
+      },
+      {
+        "id": "CH-R10",
+        "error_signals": ["SYNTAX_ERROR", "SyntaxError", "UNEXPECTED_PACKET_FROM_CLIENT"],
+        "class": "NON_RETRYABLE",
+        "description": "Malformed query — generated SQL has syntax error, code bug"
+      },
+      {
+        "id": "CH-R11",
+        "error_signals": ["Broken pipe", "BrokenPipeError", "Connection reset"],
+        "class": "RETRYABLE",
+        "description": "Mid-write connection drop — retry is safe (ClickHouse insert is transactional)"
+      }
+    ],
+    "neo4j": [
+      {
+        "id": "N4-R01",
+        "error_signals": ["ServiceUnavailable", "Unable to connect", "Connection refused", "Could not perform discovery"],
+        "class": "RETRYABLE",
+        "description": "Neo4j container unreachable — transient restart or Docker stop"
+      },
+      {
+        "id": "N4-R02",
+        "error_signals": ["SessionExpired", "Session expired", "session has been marked as failed"],
+        "class": "RETRYABLE",
+        "description": "Session timeout — retry with new session"
+      },
+      {
+        "id": "N4-R03",
+        "error_signals": ["TransientError", "Neo.TransientError", "DeadlockDetected", "MemoryPoolOutOfMemoryError"],
+        "class": "RETRYABLE",
+        "description": "Transient server-side error — retry is explicitly recommended by Neo4j protocol"
+      },
+      {
+        "id": "N4-R04",
+        "error_signals": ["ConstraintValidationFailed", "Neo.ClientError.Schema.ConstraintValidationFailed"],
+        "class": "ALREADY_SYNCED",
+        "description": "Node/relationship already exists with unique constraint — idempotent MERGE confirms delivery"
+      },
+      {
+        "id": "N4-R05",
+        "error_signals": ["SyntaxError", "Neo.ClientError.Statement.SyntaxError", "InvalidSyntax"],
+        "class": "NON_RETRYABLE",
+        "description": "Cypher query syntax error — code bug, not data issue"
+      },
+      {
+        "id": "N4-R06",
+        "error_signals": ["AuthenticationRateLimit", "TooManyRequests", "429"],
+        "class": "RETRYABLE",
+        "description": "Auth rate limit — retry after backoff"
+      },
+      {
+        "id": "N4-R07",
+        "error_signals": ["AuthError", "Unauthorized", "authentication failure"],
+        "class": "NON_RETRYABLE",
+        "description": "Credentials invalid — operator must fix before events can be delivered"
+      },
+      {
+        "id": "N4-R08",
+        "error_signals": ["EntityNotFound", "NotFound", "LabelNotFound"],
+        "class": "NON_RETRYABLE",
+        "description": "Schema element referenced does not exist in DB — schema mismatch"
+      },
+      {
+        "id": "N4-R09",
+        "error_signals": ["ClientError", "Neo.ClientError.Request.InvalidFormat"],
+        "class": "NON_RETRYABLE",
+        "description": "Malformed request — payload or query generator has a bug"
+      },
+      {
+        "id": "N4-R10",
+        "error_signals": ["Broken pipe", "Connection reset", "BrokenPipe"],
+        "class": "RETRYABLE",
+        "description": "Mid-write connection drop — MERGE is idempotent, retry is safe"
+      }
+    ]
+  },
+  "lookup_algorithm": {
+    "description": "To classify an error, iterate rules for the relevant sink_target in order. For each rule, check if ANY error_signal string appears as a substring (case-insensitive) in the error message. Return the class of the first matching rule. If no rule matches, return UNKNOWN.",
+    "pseudocode": [
+      "def classify_error(sink_target, error_message):",
+      "    rules = taxonomy['rules'][sink_target]",
+      "    err_lower = error_message.lower()",
+      "    for rule in rules:",
+      "        for signal in rule['error_signals']:",
+      "            if signal.lower() in err_lower:",
+      "                return rule['class']",
+      "    return 'UNKNOWN'"
+    ]
+  },
+  "dead_letter_escalation_policy": {
+    "RETRYABLE_EXHAUSTED": "retry_count >= max_retries on RETRYABLE error → DEAD_LETTER",
+    "NON_RETRYABLE": "Any NON_RETRYABLE error on any attempt → immediate DEAD_LETTER",
+    "UNKNOWN_EXHAUSTED": "retry_count >= 2 on UNKNOWN error → DEAD_LETTER",
+    "review_required": true,
+    "auto_replay": false,
+    "replay_trigger": "Operator sets dead_letter_events.replay_requested = 1 after investigation"
+  }
+}

@@ -1,0 +1,141 @@
+{
+  "work_order": "WO-00023",
+  "category": "data-engineering",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "source_commit": "trinity999/Pandavs-Framework@cebd2d5",
+  "confidence": 0.93,
+
+  "key_findings": [
+    "persistence_gateway.py events table has no per-sink delivery tracking — sync markers missing; Phase 2 PHASE_IMPLEMENTATION_PLAN.md explicitly requires adding these",
+    "Separate sink_outbox table preferred over ALTER TABLE columns on events: avoids lock on 10M+ row table, enables per-sink independent retry, separates ingestion from delivery concerns",
+    "event_id (SHA-256 of tool|kind|asset|value|port|source_file|line_no) is the natural idempotency key for all sink writes — already computed by persistence_gateway; reused as FK in outbox",
+    "ALREADY_SYNCED is a distinct error class — ClickHouse UNIQUE_VIOLATION and Neo4j ConstraintValidationFailed both indicate the event is already delivered; treat as SYNCED, not FAILED",
+    "event_sync_ledger is append-only (immutable receipts) — enables complete delivery audit trail and idempotent replay detection without overwriting state",
+    "dead_letter_events preserves raw_json_snapshot at time of final failure — critical for forensic analysis and manual replay; never delete DLQ entries without review",
+    "Retry taxonomy covers 11 ClickHouse + 10 Neo4j error patterns with RETRYABLE/NON_RETRYABLE/ALREADY_SYNCED classifications; UNKNOWN errors treated as RETRYABLE with reduced max_retries=2",
+    "Backfill queries (commented in migration SQL) populate sink_outbox for pre-existing events at Phase 2 startup without touching the events table"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "Separate sink_outbox table, not columns on events",
+      "rationale": "Avoids ALTER TABLE on 10M+ row table; per-sink independent retry; clean separation of ingestion vs delivery concerns"
+    },
+    {
+      "id": "D2",
+      "decision": "One sink_outbox row per (event_id, sink_target)",
+      "rationale": "ClickHouse and Neo4j fail independently; per-sink rows allow one sink to be SYNCED while the other retries"
+    },
+    {
+      "id": "D3",
+      "decision": "event_sync_ledger is append-only (no DELETE/UPDATE)",
+      "rationale": "Immutable audit trail; enables complete delivery history; supports compliance and post-mortem analysis"
+    },
+    {
+      "id": "D4",
+      "decision": "ALREADY_SYNCED is a success class, not a failure",
+      "rationale": "Duplicate detection at sink (ClickHouse UNIQUE_VIOLATION, Neo4j MERGE find) confirms event exists; marking SYNCED enables correct delivery accounting"
+    },
+    {
+      "id": "D5",
+      "decision": "Exponential backoff base=60s, doubles per retry, max 5 retries",
+      "rationale": "Base 60s handles transient restarts; 5 attempts = max 960s wait = ~16min total; prevents retry storms on systematic failures"
+    },
+    {
+      "id": "D6",
+      "decision": "Dead letter requires human review before replay",
+      "rationale": "Automatic replay of malformed payloads would re-fill DLQ; operator investigation ensures root cause is fixed"
+    }
+  ],
+
+  "schema": {
+    "new_tables": ["sink_outbox", "event_sync_ledger", "dead_letter_events", "sink_outbox_retry_log"],
+    "modified_tables": [],
+    "new_indexes": [
+      "idx_so_status_target", "idx_so_retry_ready", "idx_so_event_id",
+      "idx_esl_event_id", "idx_esl_synced_at", "idx_esl_target",
+      "idx_dle_event_id", "idx_dle_unreviewed", "idx_dle_replay_ready",
+      "idx_sorl_outbox_id"
+    ],
+    "new_triggers": ["trg_so_updated_at"],
+    "migration_type": "additive",
+    "safe_to_run_on_existing_db": true,
+    "requires_backfill": true,
+    "backfill_queries": ["BACKFILL-1 (clickhouse)", "BACKFILL-2 (neo4j)"]
+  },
+
+  "retry_taxonomy_summary": {
+    "clickhouse_rules": 11,
+    "neo4j_rules": 10,
+    "classes": ["RETRYABLE", "NON_RETRYABLE", "ALREADY_SYNCED", "UNKNOWN"],
+    "lookup_method": "substring match (case-insensitive) on error message, first match wins",
+    "file": "retry_taxonomy.json"
+  },
+
+  "outbox_state_machine": {
+    "states": ["PENDING", "SYNCED", "FAILED", "DEAD_LETTER"],
+    "transitions": [
+      {"from": null, "to": "PENDING", "trigger": "backfill or ingest-time population"},
+      {"from": "PENDING", "to": "SYNCED", "trigger": "successful sink write"},
+      {"from": "PENDING", "to": "SYNCED", "trigger": "ALREADY_SYNCED error (idempotent replay)"},
+      {"from": "PENDING", "to": "FAILED", "trigger": "RETRYABLE error, retry_count < max"},
+      {"from": "PENDING", "to": "DEAD_LETTER", "trigger": "NON_RETRYABLE error (any attempt)"},
+      {"from": "FAILED", "to": "PENDING", "trigger": "next_retry_at reached (sweep picks up again)"},
+      {"from": "FAILED", "to": "DEAD_LETTER", "trigger": "retry_count >= max_retries"},
+      {"from": "DEAD_LETTER", "to": "PENDING", "trigger": "operator sets replay_requested=1 (manual)"}
+    ]
+  },
+
+  "risk_model": [
+    {
+      "id": "R1",
+      "risk": "Outbox grows unbounded if sinks are permanently down",
+      "severity": "HIGH",
+      "mitigation": "Monitor MON-B (oldest pending age); alert if > 2h; auto-escalate to DLQ after max_retries"
+    },
+    {
+      "id": "R2",
+      "risk": "Duplicate writes to ClickHouse on retry",
+      "severity": "MEDIUM",
+      "mitigation": "ALREADY_SYNCED class catches UNIQUE_VIOLATION and marks SYNCED; ClickHouse dedup key = event_id"
+    },
+    {
+      "id": "R3",
+      "risk": "Sync ledger grows to 20M+ rows (10M events × 2 sinks)",
+      "severity": "MEDIUM",
+      "mitigation": "Cold SYNCED rows indexed by synced_at; partition/archive after 30 days; PENDING/FAILED remain hot"
+    },
+    {
+      "id": "R4",
+      "risk": "DLQ accumulates non-retried entries indefinitely",
+      "severity": "MEDIUM",
+      "mitigation": "Alert on any unreviewed DLQ entry (MON-D); require operator review and replay_requested flag before retry"
+    }
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "action": "Apply sqlite_schema_migration.sql to scan_persistence.db"},
+    {"priority": 2, "action": "Run BACKFILL-1 + BACKFILL-2 queries to populate sink_outbox for all existing events"},
+    {"priority": 3, "action": "Implement outbox_sweep_worker.py using classify_error() from retry_taxonomy.json"},
+    {"priority": 4, "action": "Add MON-F monitoring query to hourly status report"},
+    {"priority": 5, "action": "Alert on dead_letter_events count > 0 (unreviewed)"},
+    {"priority": 6, "action": "Run idempotency drill: execute sweep twice, verify ClickHouse/Neo4j row counts unchanged"}
+  ],
+
+  "metrics": {
+    "new_tables": 4,
+    "new_indexes": 10,
+    "new_triggers": 1,
+    "retry_rules_clickhouse": 11,
+    "retry_rules_neo4j": 10,
+    "max_retries_per_sink": 5,
+    "backoff_base_s": 60,
+    "backoff_max_s": 3600,
+    "batch_size_recommended": 500,
+    "target_oldest_pending_h": 2.0,
+    "target_duplicate_rate_pct": 0.1,
+    "target_dlq_count": 0
+  }
+}
