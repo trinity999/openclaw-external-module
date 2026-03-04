@@ -1,0 +1,433 @@
+{
+  "work_order": "WO-00021",
+  "framework_version": "1.0",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "analyst": "openclaw-field-processor",
+  "source_work_orders": ["WO-00019", "WO-00020"],
+  "total_hour_window": 36,
+  "total_tasks": 18,
+  "total_gates": 3,
+
+  "gates": [
+    {
+      "id": "GATE-H6",
+      "name": "Phase 1 Completion Gate",
+      "phase": "H0-H6",
+      "evaluated_at_hour": 6,
+      "blocking_for": "GATE-H18",
+      "gate_type": "go_no_go",
+      "description": "Confirms SQLite durability layer is fully operational before sink connections are attempted",
+      "criteria": [
+        {
+          "id": "G1-C1",
+          "name": "WAL mode active",
+          "sql_test": "PRAGMA journal_mode",
+          "expected_value": "wal",
+          "comparison": "eq",
+          "fail_action": "revert_to_rollback_journal",
+          "severity": "blocking"
+        },
+        {
+          "id": "G1-C2",
+          "name": "chunk_queue populated with 51 rows",
+          "sql_test": "SELECT count(*) FROM chunk_queue",
+          "expected_value": 51,
+          "comparison": "eq",
+          "fail_action": "repopulate_chunk_queue_from_source",
+          "severity": "blocking"
+        },
+        {
+          "id": "G1-C3",
+          "name": "sink_outbox receiving records",
+          "sql_test": "SELECT count(*) FROM sink_outbox WHERE created_at > datetime('now','-5 minutes')",
+          "expected_value": 0,
+          "comparison": "gt",
+          "fail_action": "investigate_persistence_gateway_integration",
+          "severity": "blocking"
+        },
+        {
+          "id": "G1-C4",
+          "name": "No SQLITE_BUSY errors in last 30 minutes",
+          "sql_test": null,
+          "manual_check": "Scan error logs for SQLITE_BUSY in last 30 min window",
+          "expected_value": 0,
+          "comparison": "eq",
+          "fail_action": "investigate_write_contention_increase_wal_checkpoint_interval",
+          "severity": "blocking"
+        },
+        {
+          "id": "G1-C5",
+          "name": "Master status query baseline captured",
+          "sql_test": null,
+          "manual_check": "Verify baseline snapshot logged with non-null values for all columns",
+          "expected_value": true,
+          "comparison": "eq",
+          "fail_action": "redeploy_status_query_and_capture_baseline",
+          "severity": "non_blocking"
+        }
+      ],
+      "pass_condition": "all_blocking_criteria_pass",
+      "rollback_action": {
+        "trigger": "any_blocking_criterion_fails",
+        "steps": [
+          "Do not start Phase 2",
+          "Identify failing criterion from gate table",
+          "Execute fail_action for that criterion",
+          "Re-run full gate evaluation after fix",
+          "Log re-evaluation attempt in incident log"
+        ]
+      },
+      "promotion_action": {
+        "trigger": "all_criteria_pass",
+        "steps": [
+          "Log GATE-H6 PASS with timestamp",
+          "Begin Phase 2 task T007",
+          "Update execution tracker GATE column for H6 to PASS"
+        ]
+      }
+    },
+    {
+      "id": "GATE-H18",
+      "name": "Phase 2 Completion Gate (Hard Gate — Path B Blocker)",
+      "phase": "H6-H18",
+      "evaluated_at_hour": 18,
+      "blocking_for": "GATE-H36",
+      "gate_type": "hard_go_no_go",
+      "description": "The single most important gate. SLO-1 (zero duplicate chunk executions) is an absolute blocker for Path B. No Pandavs integration begins without this gate passing clean.",
+      "criteria": [
+        {
+          "id": "G2-C1",
+          "name": "SLO-1: Zero duplicate chunk executions",
+          "sql_test": "SELECT chunk_id, count(*) as cnt FROM chunk_queue WHERE status='COMPLETED' GROUP BY chunk_id HAVING count(*) > 1",
+          "expected_value": 0,
+          "comparison": "row_count_eq",
+          "fail_action": "MANDATORY_STOP_rollback_grant_lease_revert_to_file_list_dispatch",
+          "severity": "absolute_blocker",
+          "notes": "If this returns ANY rows, Phase 3 is BLOCKED regardless of all other criteria. Fix lease isolation first."
+        },
+        {
+          "id": "G2-C2",
+          "name": "SLO-2: Outbox pending age < 2h",
+          "sql_test": "SELECT max((julianday('now') - julianday(created_at)) * 24) AS oldest_h FROM sink_outbox WHERE synced_at IS NULL",
+          "expected_value": 2.0,
+          "comparison": "lt",
+          "fail_action": "investigate_sink_write_failures_check_outbox_sweep_frequency",
+          "severity": "blocking"
+        },
+        {
+          "id": "G2-C3",
+          "name": "Heartbeat reclaim working",
+          "sql_test": null,
+          "manual_check": "Inject stale lease; confirm auto-reclaim within 2x heartbeat interval; measure actual reclaim time",
+          "expected_value": true,
+          "comparison": "eq",
+          "fail_action": "fix_reclaim_expired_leases_function_increase_heartbeat_monitoring",
+          "severity": "blocking"
+        },
+        {
+          "id": "G2-C4",
+          "name": "Backpressure signals active",
+          "sql_test": null,
+          "manual_check": "Inject 10001 pending records into outbox; confirm concurrency reduction logged within 1 heartbeat cycle",
+          "expected_value": true,
+          "comparison": "eq",
+          "fail_action": "redeploy_backpressure_controller_verify_ORS_signal_path",
+          "severity": "blocking"
+        },
+        {
+          "id": "G2-C5",
+          "name": "DB-derived metrics cron active (3 monotonic reports)",
+          "sql_test": null,
+          "manual_check": "Check 3 consecutive hourly reports; verify events_persisted and sink_synced_count are monotonically increasing; verify no file-system count used",
+          "expected_value": true,
+          "comparison": "eq",
+          "fail_action": "investigate_non_monotonic_report_query_check_for_record_deletions",
+          "severity": "blocking"
+        },
+        {
+          "id": "G2-C6",
+          "name": "Live sink writes confirmed",
+          "sql_test": "SELECT count(*) FROM sink_outbox WHERE synced_at IS NOT NULL",
+          "expected_value": 0,
+          "comparison": "gt",
+          "fail_action": "enable_live_sink_write_mode_investigate_outbox_sweep_errors",
+          "severity": "blocking"
+        }
+      ],
+      "pass_condition": "all_blocking_criteria_pass",
+      "rollback_action": {
+        "trigger": "any_blocking_criterion_fails",
+        "steps": [
+          "DO NOT START PHASE 3",
+          "If G2-C1 fails: immediately rollback grant_lease() to previous version; switch to file-list dispatch; audit chunk_queue for duplication source",
+          "For all other failures: fix failing criterion; re-run full gate evaluation",
+          "Log re-evaluation attempt with timestamp in incident log",
+          "Phase 3 start time shifts to new gate pass time"
+        ]
+      },
+      "promotion_action": {
+        "trigger": "all_criteria_pass",
+        "steps": [
+          "Log GATE-H18 PASS with timestamp",
+          "Begin Phase 3 task T013 (Pandavs connectivity validation)",
+          "Update execution tracker GATE column for H18 to PASS",
+          "Confirm: SQLite outbox sweep continues unchanged during Phase 3"
+        ]
+      }
+    },
+    {
+      "id": "GATE-H36",
+      "name": "Path B Promotion Gate",
+      "phase": "H18-H36",
+      "evaluated_at_hour": 36,
+      "blocking_for": null,
+      "gate_type": "promotion_gate",
+      "description": "Evaluates whether Pandavs has proven sufficient integrity and operational stability over the 18h dual-write window to be promoted to primary sink. Failure means Path A indefinitely.",
+      "criteria": [
+        {
+          "id": "G3-C1",
+          "name": "Integrity delta < 1%",
+          "sql_test": null,
+          "manual_check": "Calculate: abs(pandavs_ingest_count - outbox_synced_count) / outbox_synced_count * 100",
+          "expected_value": 1.0,
+          "comparison": "lt",
+          "fail_action": "rollback_to_path_a_indefinitely_audit_missing_records",
+          "severity": "blocking"
+        },
+        {
+          "id": "G3-C2",
+          "name": "Hourly monotonicity 100% for 18h window",
+          "sql_test": null,
+          "manual_check": "Review all hourly reports from H18 to H36; both outbox_synced and pandavs_ingest columns must be monotonically non-decreasing",
+          "expected_value": 100.0,
+          "comparison": "eq",
+          "fail_action": "investigate_non_monotonic_event_find_record_deletion_or_replay",
+          "severity": "blocking"
+        },
+        {
+          "id": "G3-C3",
+          "name": "MTTR drill < 15 minutes",
+          "sql_test": null,
+          "manual_check": "T017 result: total time from Pandavs kill to restart + full catch-up to current outbox head",
+          "expected_value": 15,
+          "comparison": "lt",
+          "fail_action": "optimize_pandavs_restart_sequence_do_not_promote",
+          "severity": "blocking"
+        },
+        {
+          "id": "G3-C4",
+          "name": "Rollback test < 5 min, 0 records lost",
+          "sql_test": null,
+          "manual_check": "T018 result: time from disable sink_target='pandavs' to Path A fully restored; verify outbox pending depth unchanged",
+          "expected_value": 5,
+          "comparison": "lt",
+          "fail_action": "rollback_mechanism_broken_halt_phase3_restore_path_a_manually",
+          "severity": "blocking"
+        },
+        {
+          "id": "G3-C5",
+          "name": "Dead letter count = 0",
+          "sql_test": "SELECT count(*) FROM sink_outbox WHERE status='DEAD_LETTER'",
+          "expected_value": 0,
+          "comparison": "eq",
+          "fail_action": "investigate_dead_letter_root_cause_resolve_before_promotion",
+          "severity": "blocking"
+        },
+        {
+          "id": "G3-C6",
+          "name": "Zero unhandled Pandavs crashes in 18h window",
+          "sql_test": null,
+          "manual_check": "Scan Pandavs error log from Phase 3 start to gate evaluation time; count unhandled exceptions",
+          "expected_value": 0,
+          "comparison": "eq",
+          "fail_action": "investigate_crash_root_cause_do_not_promote",
+          "severity": "blocking"
+        }
+      ],
+      "pass_condition": "all_blocking_criteria_pass",
+      "rollback_action": {
+        "trigger": "any_blocking_criterion_fails",
+        "steps": [
+          "Disable sink_target='pandavs' in outbox sweep configuration",
+          "Verify SQLite outbox sweep resumes full throughput",
+          "Confirm zero records lost (outbox pending depth check)",
+          "Log failure root cause in incident log",
+          "Schedule new 36h Path B window after root cause resolved",
+          "Do not retry Path B promotion within same operational window"
+        ]
+      },
+      "promotion_action": {
+        "trigger": "all_criteria_pass",
+        "steps": [
+          "Log GATE-H36 PASS with timestamp",
+          "Promote Pandavs to primary sink",
+          "Disable SQLite outbox sweep for Pandavs path (keep SQLite as safety net for 1 additional 24h window)",
+          "Update execution tracker FINAL STATUS to PATH B PROMOTED",
+          "File post-implementation report referencing this tracker"
+        ]
+      }
+    }
+  ],
+
+  "tasks": [
+    {
+      "id": "T001", "phase": "H0-H6", "name": "Enable SQLite WAL mode",
+      "h_min": 0, "h_max": 1, "dependencies": [],
+      "acceptance_test": "PRAGMA journal_mode returns wal; concurrent read succeeds without SQLITE_BUSY",
+      "risk": "LOW", "effort_h": 0.5, "blocks_gate": "GATE-H6"
+    },
+    {
+      "id": "T002", "phase": "H0-H6", "name": "Initialize chunk_queue table",
+      "h_min": 0, "h_max": 2, "dependencies": ["T001"],
+      "acceptance_test": "51 rows; all columns; idx_cq_status and idx_cq_lease_expires present",
+      "risk": "LOW", "effort_h": 1.0, "blocks_gate": "GATE-H6"
+    },
+    {
+      "id": "T003", "phase": "H0-H6", "name": "Implement grant_lease() with IMMEDIATE isolation",
+      "h_min": 1, "h_max": 3, "dependencies": ["T002"],
+      "acceptance_test": "10 concurrent requests → 1 successful grant per chunk; no duplicate LEASED rows",
+      "risk": "MEDIUM", "effort_h": 1.5, "blocks_gate": "GATE-H6"
+    },
+    {
+      "id": "T004", "phase": "H0-H6", "name": "Create sink_outbox and sink_sync_ledger tables",
+      "h_min": 2, "h_max": 4, "dependencies": ["T001"],
+      "acceptance_test": "UNIQUE(record_id) constraint present; duplicate insert raises constraint failed",
+      "risk": "LOW", "effort_h": 0.5, "blocks_gate": "GATE-H6"
+    },
+    {
+      "id": "T005", "phase": "H0-H6", "name": "Integrate outbox write into persistence_gateway",
+      "h_min": 3, "h_max": 5, "dependencies": ["T003", "T004"],
+      "acceptance_test": "Every chunk completion writes >=1 record to sink_outbox; WAL durability confirmed",
+      "risk": "MEDIUM", "effort_h": 1.5, "blocks_gate": "GATE-H6"
+    },
+    {
+      "id": "T006", "phase": "H0-H6", "name": "Deploy master status query as monitoring baseline",
+      "h_min": 5, "h_max": 6, "dependencies": ["T002", "T004"],
+      "acceptance_test": "Query <100ms; baseline snapshot captured with non-null values",
+      "risk": "LOW", "effort_h": 0.5, "blocks_gate": "GATE-H6"
+    },
+    {
+      "id": "T007", "phase": "H6-H18", "name": "Implement outbox sweep (dry-run first)",
+      "h_min": 6, "h_max": 8, "dependencies": ["T005"],
+      "acceptance_test": "Dry-run: all pending records logged, zero sink writes, zero dropped records",
+      "risk": "MEDIUM", "effort_h": 1.5, "blocks_gate": "GATE-H18"
+    },
+    {
+      "id": "T008", "phase": "H6-H18", "name": "Implement heartbeat + stale lease reclaim",
+      "h_min": 7, "h_max": 9, "dependencies": ["T003"],
+      "acceptance_test": "heartbeat() updates last_heartbeat_at; reclaim returns stale LEASED to PENDING within 2x interval",
+      "risk": "MEDIUM", "effort_h": 1.5, "blocks_gate": "GATE-H18"
+    },
+    {
+      "id": "T009", "phase": "H6-H18", "name": "Deploy backpressure controller",
+      "h_min": 8, "h_max": 11, "dependencies": ["T007", "T008"],
+      "acceptance_test": "depth>10000 → 25% concurrency reduction logged; depth>50000 → lease halt; ORS signal within 1 cycle",
+      "risk": "MEDIUM", "effort_h": 2.0, "blocks_gate": "GATE-H18"
+    },
+    {
+      "id": "T010", "phase": "H6-H18", "name": "Run SLO-1 + SLO-2 drills",
+      "h_min": 9, "h_max": 13, "dependencies": ["T008", "T009"],
+      "acceptance_test": "SLO-1: 0 duplicate chunk_ids in completed status; SLO-2: oldest outbox pending < 2h",
+      "risk": "HIGH", "effort_h": 2.5, "blocks_gate": "GATE-H18",
+      "critical_note": "SLO-1 FAIL = mandatory stop and rollback. No exceptions."
+    },
+    {
+      "id": "T011", "phase": "H6-H18", "name": "Validate outbox age under load; enable live sink writes",
+      "h_min": 11, "h_max": 14, "dependencies": ["T010"],
+      "acceptance_test": "Oldest pending < 2h under full throughput; live writes enabled; first sync batch confirmed",
+      "risk": "MEDIUM", "effort_h": 1.5, "blocks_gate": "GATE-H18"
+    },
+    {
+      "id": "T012", "phase": "H6-H18", "name": "Deploy hourly monotonic metrics cron",
+      "h_min": 13, "h_max": 16, "dependencies": ["T005", "T011"],
+      "acceptance_test": "3 consecutive hourly reports monotonically increasing; no file-system counts",
+      "risk": "LOW", "effort_h": 1.5, "blocks_gate": "GATE-H18"
+    },
+    {
+      "id": "T013", "phase": "H18-H36", "name": "Validate Pandavs connectivity + schema compatibility",
+      "h_min": 18, "h_max": 20, "dependencies": ["GATE-H18"],
+      "acceptance_test": "Pandavs responds; schema compatible; runtime match confirmed; test write succeeds",
+      "risk": "HIGH", "effort_h": 1.5, "blocks_gate": "GATE-H36",
+      "abort_condition": "Any check fails → abort Phase 3, maintain Path A indefinitely"
+    },
+    {
+      "id": "T014", "phase": "H18-H36", "name": "Add Pandavs as parallel sink_target in sink_outbox",
+      "h_min": 19, "h_max": 22, "dependencies": ["T013"],
+      "acceptance_test": "Dual-write active; zero records dropped; SQLite sweep continues unmodified",
+      "risk": "HIGH", "effort_h": 2.0, "blocks_gate": "GATE-H36"
+    },
+    {
+      "id": "T015", "phase": "H18-H36", "name": "Dual-write verification: row count comparison",
+      "h_min": 21, "h_max": 25, "dependencies": ["T014"],
+      "acceptance_test": "After 3h dual-write: delta = abs(pandavs_count - outbox_count) / outbox_count < 1%",
+      "risk": "HIGH", "effort_h": 2.0, "blocks_gate": "GATE-H36"
+    },
+    {
+      "id": "T016", "phase": "H18-H36", "name": "DB-derived metrics with Pandavs comparison column",
+      "h_min": 23, "h_max": 27, "dependencies": ["T015"],
+      "acceptance_test": "Hourly report has both sinks; delta column computed; both columns monotonic",
+      "risk": "MEDIUM", "effort_h": 1.5, "blocks_gate": "GATE-H36"
+    },
+    {
+      "id": "T017", "phase": "H18-H36", "name": "MTTR drill: kill Pandavs, measure restart + catch-up",
+      "h_min": 27, "h_max": 30, "dependencies": ["T015"],
+      "acceptance_test": "Total MTTR (kill → full catch-up) < 15 minutes",
+      "risk": "MEDIUM", "effort_h": 1.5, "blocks_gate": "GATE-H36"
+    },
+    {
+      "id": "T018", "phase": "H18-H36", "name": "Contingency validation: rollback test",
+      "h_min": 27, "h_max": 30, "dependencies": ["T014"],
+      "acceptance_test": "Disabling Pandavs sink_target restores Path A < 5 min; 0 records lost",
+      "risk": "MEDIUM", "effort_h": 1.5, "blocks_gate": "GATE-H36"
+    }
+  ],
+
+  "hourly_report_schema": {
+    "description": "Required fields for every hourly progress report during the 36h execution window",
+    "fields": {
+      "report_hour": {"type": "int", "description": "Hour offset from session start (1–36)"},
+      "reported_at": {"type": "ISO8601", "description": "Timestamp of report generation"},
+      "current_phase": {"type": "string", "enum": ["H0-H6", "H6-H18", "H18-H36"]},
+      "chunks_done": {"type": "int", "sql": "SELECT count(*) FROM chunk_queue WHERE status='COMPLETED'"},
+      "coverage_pct": {"type": "float", "sql": "SELECT round(count(CASE WHEN status='COMPLETED' THEN 1 END) * 100.0 / 51, 2) FROM chunk_queue"},
+      "events_persisted": {"type": "int", "sql": "SELECT sum(CASE WHEN record_count_produced IS NOT NULL THEN record_count_produced ELSE 0 END) FROM chunk_queue"},
+      "sink_lag_h": {
+        "type": "float",
+        "sql": "SELECT round(max((julianday('now') - julianday(created_at)) * 24), 2) FROM sink_outbox WHERE synced_at IS NULL",
+        "alert_threshold": 2.0,
+        "alert_action": "Immediate blocker regardless of phase; reduce concurrency 50%; alert operator"
+      },
+      "eta_h": {"type": "float", "description": "Estimated hours remaining to current phase gate or H36"},
+      "blockers": {"type": "list[string]", "description": "Active blockers by task ID or description; empty list if none"},
+      "gate_status": {"type": "string", "enum": ["PENDING", "PASS", "FAIL", "N/A"]},
+      "active_task_ids": {"type": "list[string]", "description": "Task IDs currently in progress"}
+    }
+  },
+
+  "critical_path": {
+    "phase_1": ["T001", "T002", "T003", "T004", "T005", "GATE-H6"],
+    "phase_1_h": 5.5,
+    "phase_2": ["T007", "T008", "T009", "T010", "T011", "GATE-H18"],
+    "phase_2_h": 8.5,
+    "phase_3": ["T013", "T014", "T015", "T016", "T017", "GATE-H36"],
+    "phase_3_h": 11.5,
+    "total_critical_path_h": 25.5
+  },
+
+  "anti_patterns": [
+    {"pattern": "truncate_sink_outbox", "reason": "Destroys replay capability"},
+    {"pattern": "disable_wal_mode", "reason": "Write contention; crashes under load"},
+    {"pattern": "change_dedup_key_mid_run", "reason": "Creates duplicate rows on replay"},
+    {"pattern": "pandavs_before_slo1_drill", "reason": "No fallback if Pandavs fails with duplicates"},
+    {"pattern": "schema_migration_during_scan", "reason": "Table lock drops records"},
+    {"pattern": "delete_failed_permanent_chunks", "reason": "Loses audit trail"},
+    {"pattern": "inline_sink_without_outbox", "reason": "Silent failure risk"},
+    {"pattern": "restart_without_lease_check", "reason": "Orphans active leases"}
+  ],
+
+  "metadata": {
+    "reuse_instructions": "Replace T001-T006 with lane-specific setup tasks for nuclei/enrichment lanes; retain Phase 2 backpressure and SLO patterns unchanged; Phase 3 gate criteria are pipeline-agnostic and remain valid",
+    "gate_evaluation_automation": "All sql_test fields in gate criteria can be executed programmatically against scan_persistence.db; non-null result vs expected_value + comparison operator yields pass/fail; manual_check fields require human verification",
+    "tracker_template": "execution_tracker_template.md — fill in during actual 36h rollout window"
+  }
+}

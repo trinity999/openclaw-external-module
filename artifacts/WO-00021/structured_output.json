@@ -1,0 +1,173 @@
+{
+  "work_order": "WO-00021",
+  "category": "execution-tracking",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "confidence": 0.94,
+  "source_work_orders": ["WO-00019", "WO-00020"],
+
+  "key_findings": [
+    "Three-phase 36h execution window: H0-H6 (SQLite durability foundation), H6-H18 (sink lifecycle hardening), H18-H36 (Pandavs parallel sink integration)",
+    "H18 Go-Gate is the single most critical checkpoint: SLO-1 (zero duplicate chunk executions) is an absolute blocker for Phase 3 entry — no exceptions under any operational pressure",
+    "H6 Go-Gate has 4 blocking criteria and 1 non-blocking; H18 has 6 blocking criteria; H36 has 6 blocking criteria — 'promote only on evidence' is the governing discipline",
+    "Every gate has an explicit rollback action mapped to individual failing criteria — operators have an unambiguous action for any failure mode without consulting the report",
+    "Hourly report schema is DB-derived and mandatory: chunks_done, coverage_pct, events_persisted, sink_lag_h, eta_h, blockers — sink_lag_h > 2h is an immediate blocker at any phase",
+    "sink_lag_h is the canary metric: if it exceeds 2.0h at any point during Phases 1-2, it is an immediate blocker requiring concurrency reduction before any gate evaluation",
+    "Phase 3 is fully additive: SQLite outbox sweep continues unchanged throughout Phase 3; Pandavs is added alongside, never replacing, until H36 gate confirms integrity",
+    "Tracker template (execution_tracker_template.md) is a fill-in-place operational document; gate evaluation sections cannot be marked PASS without all sub-criteria checked off",
+    "Critical path: Phase 1 = 5.5h, Phase 2 = 8.5h, Phase 3 = 11.5h, total = 25.5h on critical path; slack exists for non-critical-path tasks",
+    "Framework is reusable: Phase 2 backpressure/SLO patterns and Phase 3 gate criteria are pipeline-agnostic; replace only Phase 1 setup tasks for nuclei/enrichment lanes"
+  ],
+
+  "phases": [
+    {
+      "id": "PHASE-1",
+      "name": "Zero-Loss Local Capture",
+      "window": "H0-H6",
+      "path": "Path A",
+      "objective": "Establish SQLite durability layer; all records in SQLite before any sink attempt",
+      "tasks": ["T001", "T002", "T003", "T004", "T005", "T006"],
+      "gate": "GATE-H6",
+      "critical_path_h": 5.5,
+      "total_effort_h": 5.5,
+      "risk_level": "LOW-MEDIUM"
+    },
+    {
+      "id": "PHASE-2",
+      "name": "Sink Connection + Queue Lifecycle",
+      "window": "H6-H18",
+      "path": "Path A",
+      "objective": "Connect live sinks, harden queue lifecycle, prove SLO-1 zero duplicate executions",
+      "tasks": ["T007", "T008", "T009", "T010", "T011", "T012"],
+      "gate": "GATE-H18",
+      "critical_path_h": 8.5,
+      "total_effort_h": 10.5,
+      "risk_level": "MEDIUM-HIGH",
+      "critical_task": "T010 (SLO-1 drill) — must pass before any other Phase 2 gate criteria evaluated"
+    },
+    {
+      "id": "PHASE-3",
+      "name": "Pandavs Parallel Sink Integration",
+      "window": "H18-H36",
+      "path": "Path B (additive)",
+      "objective": "Add Pandavs as second parallel sink; verify integrity over 18h; prepare Path B promotion",
+      "tasks": ["T013", "T014", "T015", "T016", "T017", "T018"],
+      "gate": "GATE-H36",
+      "critical_path_h": 11.5,
+      "total_effort_h": 11.5,
+      "risk_level": "HIGH",
+      "conditional": true,
+      "condition": "GATE-H18 must PASS; otherwise Phase 3 deferred indefinitely"
+    }
+  ],
+
+  "gates": [
+    {
+      "id": "GATE-H6",
+      "evaluated_at_hour": 6,
+      "blocking_criteria_count": 4,
+      "non_blocking_criteria_count": 1,
+      "hardness": "standard",
+      "slo_blocker": null,
+      "rollback_if_fail": "Do not start Phase 2; fix failing criterion; re-evaluate"
+    },
+    {
+      "id": "GATE-H18",
+      "evaluated_at_hour": 18,
+      "blocking_criteria_count": 6,
+      "non_blocking_criteria_count": 0,
+      "hardness": "hard",
+      "slo_blocker": "SLO-1 (G2-C1): zero duplicate chunk executions — absolute blocker, no exceptions",
+      "rollback_if_fail": "Do not start Phase 3; if SLO-1 fails, mandatory rollback grant_lease() and revert to file-list dispatch"
+    },
+    {
+      "id": "GATE-H36",
+      "evaluated_at_hour": 36,
+      "blocking_criteria_count": 6,
+      "non_blocking_criteria_count": 0,
+      "hardness": "promotion",
+      "slo_blocker": null,
+      "rollback_if_fail": "Rollback to Path A indefinitely; disable sink_target='pandavs'; schedule new 36h window after root cause resolved"
+    }
+  ],
+
+  "hourly_report_schema": {
+    "required_fields": ["report_hour", "reported_at", "current_phase", "chunks_done", "coverage_pct", "events_persisted", "sink_lag_h", "eta_h", "blockers", "gate_status", "active_task_ids"],
+    "canary_metric": "sink_lag_h",
+    "canary_threshold_h": 2.0,
+    "canary_action": "Immediate blocker at any phase; reduce concurrency 50%; alert operator",
+    "db_derived_fields": ["chunks_done", "coverage_pct", "events_persisted", "sink_lag_h"],
+    "human_populated_fields": ["blockers", "eta_h", "active_task_ids"],
+    "prohibited": "File-system counts must never appear in any hourly report field"
+  },
+
+  "task_summary": [
+    {"id": "T001", "phase": "PHASE-1", "h_min": 0, "h_max": 1, "dependencies": [], "risk": "LOW", "effort_h": 0.5, "on_critical_path": true},
+    {"id": "T002", "phase": "PHASE-1", "h_min": 0, "h_max": 2, "dependencies": ["T001"], "risk": "LOW", "effort_h": 1.0, "on_critical_path": true},
+    {"id": "T003", "phase": "PHASE-1", "h_min": 1, "h_max": 3, "dependencies": ["T002"], "risk": "MEDIUM", "effort_h": 1.5, "on_critical_path": true},
+    {"id": "T004", "phase": "PHASE-1", "h_min": 2, "h_max": 4, "dependencies": ["T001"], "risk": "LOW", "effort_h": 0.5, "on_critical_path": true},
+    {"id": "T005", "phase": "PHASE-1", "h_min": 3, "h_max": 5, "dependencies": ["T003", "T004"], "risk": "MEDIUM", "effort_h": 1.5, "on_critical_path": true},
+    {"id": "T006", "phase": "PHASE-1", "h_min": 5, "h_max": 6, "dependencies": ["T002", "T004"], "risk": "LOW", "effort_h": 0.5, "on_critical_path": false},
+    {"id": "T007", "phase": "PHASE-2", "h_min": 6, "h_max": 8, "dependencies": ["T005"], "risk": "MEDIUM", "effort_h": 1.5, "on_critical_path": true},
+    {"id": "T008", "phase": "PHASE-2", "h_min": 7, "h_max": 9, "dependencies": ["T003"], "risk": "MEDIUM", "effort_h": 1.5, "on_critical_path": true},
+    {"id": "T009", "phase": "PHASE-2", "h_min": 8, "h_max": 11, "dependencies": ["T007", "T008"], "risk": "MEDIUM", "effort_h": 2.0, "on_critical_path": true},
+    {"id": "T010", "phase": "PHASE-2", "h_min": 9, "h_max": 13, "dependencies": ["T008", "T009"], "risk": "HIGH", "effort_h": 2.5, "on_critical_path": true},
+    {"id": "T011", "phase": "PHASE-2", "h_min": 11, "h_max": 14, "dependencies": ["T010"], "risk": "MEDIUM", "effort_h": 1.5, "on_critical_path": true},
+    {"id": "T012", "phase": "PHASE-2", "h_min": 13, "h_max": 16, "dependencies": ["T005", "T011"], "risk": "LOW", "effort_h": 1.5, "on_critical_path": false},
+    {"id": "T013", "phase": "PHASE-3", "h_min": 18, "h_max": 20, "dependencies": ["GATE-H18"], "risk": "HIGH", "effort_h": 1.5, "on_critical_path": true},
+    {"id": "T014", "phase": "PHASE-3", "h_min": 19, "h_max": 22, "dependencies": ["T013"], "risk": "HIGH", "effort_h": 2.0, "on_critical_path": true},
+    {"id": "T015", "phase": "PHASE-3", "h_min": 21, "h_max": 25, "dependencies": ["T014"], "risk": "HIGH", "effort_h": 2.0, "on_critical_path": true},
+    {"id": "T016", "phase": "PHASE-3", "h_min": 23, "h_max": 27, "dependencies": ["T015"], "risk": "MEDIUM", "effort_h": 1.5, "on_critical_path": true},
+    {"id": "T017", "phase": "PHASE-3", "h_min": 27, "h_max": 30, "dependencies": ["T015"], "risk": "MEDIUM", "effort_h": 1.5, "on_critical_path": false},
+    {"id": "T018", "phase": "PHASE-3", "h_min": 27, "h_max": 30, "dependencies": ["T014"], "risk": "MEDIUM", "effort_h": 1.5, "on_critical_path": false}
+  ],
+
+  "metrics": {
+    "total_tasks": 18,
+    "tasks_per_phase": 6,
+    "total_gates": 3,
+    "total_effort_h": 27.5,
+    "critical_path_h": 25.5,
+    "phase_1_critical_path_h": 5.5,
+    "phase_2_critical_path_h": 8.5,
+    "phase_3_critical_path_h": 11.5,
+    "hourly_reports_required": 36,
+    "slo1_target_duplicate_executions": 0,
+    "slo2_outbox_age_max_h": 2.0,
+    "integrity_delta_max_pct": 1.0,
+    "mttr_max_min": 15,
+    "rollback_max_min": 5,
+    "monotonicity_target_pct": 100
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "SLO-1 drill reveals duplicate chunk execution", "severity": "CRITICAL", "probability": "LOW", "mitigation": "Mandatory stop; rollback grant_lease(); revert to file-list dispatch; audit chunk_queue before retry"},
+    {"id": "R2", "title": "T013 schema incompatibility blocks Phase 3", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "Abort Phase 3; maintain Path A indefinitely; schema gap must be resolved in separate window"},
+    {"id": "R3", "title": "sink_lag_h exceeds 2h during Phase 2", "severity": "HIGH", "probability": "LOW", "mitigation": "Immediate: reduce concurrency 50%; investigate sink write bottleneck; do not proceed to GATE-H18 until resolved"},
+    {"id": "R4", "title": "Row count delta > 1% in T015", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "Pause dual-write; audit missing records; identify Pandavs ingest failure mode; do not proceed to T016"},
+    {"id": "R5", "title": "MTTR drill fails (> 15 min) in T017", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Do not promote; optimize restart sequence; extend Phase 3 window if feasible"},
+    {"id": "R6", "title": "Task schedule drift causes gate slip", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Hourly ETA field in progress report catches drift early; operator escalation protocol at 2h behind schedule"},
+    {"id": "R7", "title": "Non-monotonic hourly report during Phase 2", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Investigate immediately; block gate evaluation until root cause found; never accept non-monotonic as 'acceptable'"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Execute T001-T005 in strict dependency order; do not parallelise steps within critical path — each depends on the previous"},
+    {"priority": 2, "id": "REC-02", "action": "Capture master status query baseline at H1 (T006) — provides ground truth for all subsequent hourly comparisons"},
+    {"priority": 3, "id": "REC-03", "action": "Run outbox sweep T007 in dry-run mode first; review log before enabling live writes in T011 — never skip dry-run validation"},
+    {"priority": 4, "id": "REC-04", "action": "Treat sink_lag_h > 2h as a page-level alert at any hour; it gates GATE-H18 and is the canary for sink health"},
+    {"priority": 5, "id": "REC-05", "action": "SLO-1 drill at T010: run the SQL query and record the exact row count — do not proceed to T011 with non-zero result under any operational pressure"},
+    {"priority": 6, "id": "REC-06", "action": "At H18 gate: verify all 6 criteria before allowing any Phase 3 task to begin — no exceptions for 'we'll fix it in Phase 3'"},
+    {"priority": 7, "id": "REC-07", "action": "T013 is a hard abort point: if schema or runtime validation fails, stop Phase 3, document the gap, maintain Path A — do not attempt T014 with unresolved compatibility issues"},
+    {"priority": 8, "id": "REC-08", "action": "Run T017 (MTTR) and T018 (rollback test) before H36 gate evaluation — gate cannot pass without both drills complete and logged"}
+  ],
+
+  "assumptions": [
+    "A1: scan_persistence.db is accessible throughout all 36h; no planned downtime",
+    "A2: Active scanning continues throughout; no scan pause longer than heartbeat interval",
+    "A3: Hourly report generation can be automated via cron querying scan_persistence.db",
+    "A4: Pandavs module available on same host or LAN for T013 validation (no internet dependency)",
+    "A5: ClickHouse/Neo4j credentials available for live sink writes in T011",
+    "A6: All schema changes are additive; non-destructive rule enforced throughout",
+    "A7: 51-chunk run will not complete before H18 (scan will still be in progress during GATE-H18 evaluation)"
+  ]
+}
