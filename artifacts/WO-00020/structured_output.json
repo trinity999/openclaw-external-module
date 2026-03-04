@@ -1,0 +1,160 @@
+{
+  "work_order": "WO-00020",
+  "category": "operations",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "confidence": 0.91,
+
+  "key_findings": [
+    "Path A (SQLite-first) is the correct choice for H0-H18: zero runtime dependency on external systems; instant restart recovery; observable via SQL with no special tooling; all data safe before any sink attempt",
+    "Path B (native Pandavs ingestion) is the correct long-term destination but attempting it under active 10M+ scanning without a stable local fallback creates data loss risk if Pandavs encounters any runtime error",
+    "Merged strategy: execute Path A to H18 stability gate, then add Pandavs as a PARALLEL sink on top of SQLite outbox — never replace outbox before Pandavs passes H36 gate (row count delta < 1%)",
+    "Six non-negotiable controls apply regardless of path: write-before-sink, idempotent write, no schema-breaking changes, audit log preserved, rollback path available, UNIQUE constraint on record dedup",
+    "Eight anti-patterns must be forbidden during migration: truncating outbox, disabling WAL, changing dedup key formula mid-run, connecting Pandavs before SLO-1 drill, inline sink without outbox, removing FAILED_PERMANENT entries",
+    "H0-H6 priority is WAL + chunk_queue migration + outbox creation — these are the foundation; all other tasks depend on these three being complete",
+    "H18 go-gate requires 0 duplicate chunk executions in SLO-1 drill — this is the single most important gate and is blocking for Path B entry",
+    "DB-derived monotonic metrics (from chunk_queue.record_count_produced) must replace file-count based reports — file counts are non-monotonic under partial failure and scan retries"
+  ],
+
+  "verdict": {
+    "recommended_path": "MERGED (Path A first, Path B additive after H18 gate)",
+    "path_a_window": "H0-H18",
+    "path_b_window": "H18-H36+",
+    "transition_gate": "SLO-1 drill passes (0 duplicate executions) + outbox age < 2h",
+    "rollback_to": "Path A indefinitely if H36 gate fails"
+  },
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Path A before Path B: SQLite-first hardening before native ingestion",
+      "summary": "Local SQLite layer must be provably stable before adding Pandavs as a sink",
+      "rationale": "Pandavs integration failure during active scan = records lost with no fallback if SQLite is bypassed. Path A ensures every record is in SQLite before any sink attempt. Pandavs becomes an additional write path, not a replacement.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Parallel dual-sink during Path B integration (not replacement)",
+      "summary": "Pandavs added as secondary sink_target in sink_outbox; SQLite outbox sweep continues",
+      "rationale": "Dual-sink allows immediate rollback of Pandavs integration (disable sink_target='pandavs' in outbox sweep) without losing any records. Row count comparison between the two sinks validates integration before promoting Pandavs as primary.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "SLO-1 drill as hard gate between Path A and Path B",
+      "summary": "0 duplicate chunk executions required before any Path B work begins",
+      "rationale": "Pandavs integration under a system that can still duplicate chunk execution would introduce duplicates into Pandavs' dedup layer. The lease system must be proven correct first.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "DB-derived monotonic metrics replace file-count reporting",
+      "summary": "Hourly reports derive counts from chunk_queue.record_count_produced and sink_outbox.synced_count",
+      "rationale": "File counts are non-monotonic: partial scan failures, chunk retries, and artifact rotation can produce lower file counts in later windows. DB-derived counts from the outbox ledger are monotonically increasing.",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "path_comparison": {
+    "path_a": {
+      "name": "SQLite-First Hardening",
+      "window": "H0-H18",
+      "risk_data_loss": "very_low",
+      "time_to_stability_h": "6-12",
+      "report_freshness_lag_h": 2,
+      "rollback_complexity": "trivial",
+      "operational_overhead": "low",
+      "long_term_scalability": "medium"
+    },
+    "path_b": {
+      "name": "Immediate Native Pandavs Integration",
+      "window": "H18+ (after H18 gate)",
+      "risk_data_loss": "medium (without Path A foundation)",
+      "time_to_stability_h": "18-24",
+      "report_freshness_lag_h": 0,
+      "rollback_complexity": "complex",
+      "operational_overhead": "medium",
+      "long_term_scalability": "high"
+    }
+  },
+
+  "hour_budget_summary": {
+    "h0_h6": {
+      "objective": "Zero-loss local capture",
+      "tasks": ["T001 WAL enable", "T002 chunk_queue init", "T003 grant_lease", "T004 sink_outbox create", "T005 outbox write", "T006 status query"],
+      "go_gate": ["chunk_queue 51 rows", "sink_outbox receiving records", "SQLite WAL confirmed"]
+    },
+    "h6_h18": {
+      "objective": "Sink connection + queue lifecycle",
+      "tasks": ["T007 outbox sweep", "T008 heartbeat+reclaim", "T009 backpressure controller", "T010 SLO drills", "T011 outbox age validation", "T012 hourly cron"],
+      "go_gate": ["0 duplicate chunks in SLO-1", "outbox age < 2h confirmed", "heartbeat reclaim working"]
+    },
+    "h18_h36": {
+      "objective": "Pandavs integration as parallel sink",
+      "tasks": ["T013 Pandavs connectivity validation", "T014 add Pandavs sink_target", "T015 dual-write verification", "T016 row count comparison", "T017 DB-derived metrics", "T018 contingency planning"],
+      "go_gate": ["integrity delta < 1%", "hourly monotonicity 100%", "MTTR drill < 15 min"]
+    }
+  },
+
+  "non_negotiable_controls": [
+    {"control": "write_before_sink", "requirement": "Every record durably in SQLite before any sink attempt"},
+    {"control": "idempotent_write", "requirement": "Repeated sink write of same record_id = 0 additional rows"},
+    {"control": "no_schema_breaking", "requirement": "New columns only; no DROP, RENAME, type changes"},
+    {"control": "audit_log_preserved", "requirement": "chunk_queue_audit_log is append-only; no deletes"},
+    {"control": "rollback_path", "requirement": "Every change reversible without data loss"},
+    {"control": "unique_constraint", "requirement": "UNIQUE on record_id in sink_outbox and sink tables"}
+  ],
+
+  "anti_patterns": [
+    {"pattern": "truncate_sink_outbox", "reason": "Destroys replay capability"},
+    {"pattern": "disable_wal_mode", "reason": "Write contention; crashes under load"},
+    {"pattern": "change_dedup_key_mid_run", "reason": "Creates duplicate rows on replay"},
+    {"pattern": "pandavs_before_slo1_drill", "reason": "No fallback if Pandavs fails with duplicates"},
+    {"pattern": "schema_migration_during_scan", "reason": "Table lock drops records"},
+    {"pattern": "delete_failed_permanent_chunks", "reason": "Loses audit trail"},
+    {"pattern": "inline_sink_without_outbox", "reason": "Silent failure risk"},
+    {"pattern": "restart_without_lease_check", "reason": "Orphans active leases"}
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "SQLite single-writer ceiling at peak ingest", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Batch writes per chunk; WAL mode; 194 rec/sec well within SQLite ceiling"},
+    {"id": "R2", "title": "Pandavs schema incompatible with raw scan output", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "T013 validates schema compatibility before T014 dual-write; abort if incompatible"},
+    {"id": "R3", "title": "Stale open runs skew audit ledger", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Stale lease detection before any ledger reporting"},
+    {"id": "R4", "title": "Host runtime mismatch blocks Pandavs module", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "T013 validates runtime; maintain Path A indefinitely if T013 fails"},
+    {"id": "R5", "title": "Non-monotonic hourly reports", "severity": "MEDIUM", "probability": "LOW", "mitigation": "DB-derived counts from chunk_queue.record_count_produced; never file system counts"},
+    {"id": "R6", "title": "H6-H18 instability window from additive changes", "severity": "MEDIUM", "probability": "LOW", "mitigation": "All changes are additive; scanning not paused; rollback is SQLite state revert"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Execute Path A H0-H6 tasks in strict order: WAL → chunk_queue → grant_lease → sink_outbox → write integration"},
+    {"priority": 2, "id": "REC-02", "action": "Do NOT begin Path B integration until H18 go-gate passes (0 duplicates in SLO-1 drill)"},
+    {"priority": 3, "id": "REC-03", "action": "Deploy master status query as monitoring baseline at H1 — provides ground truth for all subsequent decisions"},
+    {"priority": 4, "id": "REC-04", "action": "Run outbox sweep in dry-run mode first (log only, no sink write) to validate record format before enabling live sink writes"},
+    {"priority": 5, "id": "REC-05", "action": "At H18 gate: add Pandavs as sink_target='pandavs' in sink_outbox ALONGSIDE existing sink, not replacing it"},
+    {"priority": 6, "id": "REC-06", "action": "Freeze dedup key formula for the entire 36h window — no formula changes until full cycle completes and row counts validated"},
+    {"priority": 7, "id": "REC-07", "action": "Configure MTTR drill at H30: kill Pandavs module; measure restart + catch-up time vs <15 min target"},
+    {"priority": 8, "id": "REC-08", "action": "Replace file-count hourly reports with DB-derived counts from chunk_queue + sink_outbox immediately at H6"}
+  ],
+
+  "metrics": {
+    "hourly_report_monotonicity_target_pct": 100,
+    "integrity_delta_max_pct": 1.0,
+    "restart_recovery_mttr_max_min": 15,
+    "unrecoverable_backlog_target": 0,
+    "outbox_pending_age_max_h": 2.0,
+    "duplicate_chunk_execution_target": 0,
+    "path_b_row_count_delta_max_pct": 1.0,
+    "path_a_window_h": "0-18",
+    "path_b_entry_h": 18,
+    "path_b_gate_h": 36
+  },
+
+  "assumptions": [
+    "A1: Active scanning must continue throughout; no scan pause longer than heartbeat interval",
+    "A2: Pandavs module available on same host or LAN (no internet dependency)",
+    "A3: SQLite WAL handles 194 records/sec without write contention",
+    "A4: ClickHouse/Neo4j credentials available for outbox sweep at H6",
+    "A5: 51-chunk run will not complete before H18",
+    "A6: All schema changes are additive; enforced by non-destructive rule"
+  ]
+}
