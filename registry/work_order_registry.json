@@ -216,6 +216,47 @@
       "artifact_report": "artifacts/WO-00018/report.md",
       "artifact_structured": "artifacts/WO-00018/structured_output.json",
       "confidence": "pending_ingestion_review"
+    },
+    {
+      "id": "WO-00019",
+      "category": "architecture",
+      "priority": "critical",
+      "state": "completed",
+      "created_at": "2026-03-04T00:00:00Z",
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-04T00:00:00Z",
+      "artifact_report": "artifacts/WO-00019/report.md",
+      "artifact_structured": "artifacts/WO-00019/structured_output.json",
+      "artifact_extra": "artifacts/WO-00019/prioritized_change_list.json",
+      "confidence": 0.93
+    },
+    {
+      "id": "WO-00020",
+      "category": "operations",
+      "priority": "high",
+      "state": "completed",
+      "created_at": "2026-03-04T00:00:00Z",
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-04T00:00:00Z",
+      "artifact_report": "artifacts/WO-00020/report.md",
+      "artifact_structured": "artifacts/WO-00020/structured_output.json",
+      "artifact_extra": "artifacts/WO-00020/hour_budget_matrix.csv",
+      "confidence": 0.91
+    },
+    {
+      "id": "WO-00021",
+      "category": "execution-tracking",
+      "priority": "critical",
+      "state": "completed",
+      "created_at": "2026-03-04T00:00:00Z",
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-04T00:00:00Z",
+      "artifact_report": "artifacts/WO-00021/report.md",
+      "artifact_structured": "artifacts/WO-00021/structured_output.json",
+      "artifact_tracker": "artifacts/WO-00021/execution_tracker_template.md",
+      "artifact_gates": "artifacts/WO-00021/milestone_gates.json",
+      "confidence": 0.94,
+      "depends_on": ["WO-00019", "WO-00020"]
     }
   ]
 }
