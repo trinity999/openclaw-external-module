@@ -1,0 +1,98 @@
+{
+  "work_order": "WO-00027",
+  "category": "documentation",
+  "priority": "medium",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-05T00:00:00Z",
+  "source_commit": "trinity999/Pandavs-Framework@cebd2d5",
+  "confidence": 0.92,
+
+  "key_findings": [
+    "Three recurring documentation failure modes identified across WO-00022 through WO-00030: (1) commit-unpinned source references, (2) missing structured_output.json fields (key_findings vs findings mismatch), (3) undeclared environment assumptions leading to validators/cp1252/path failures",
+    "Onboarding time < 20 min is achievable with the 4-step quick-start in operator_handoff_template.md — the pre-flight checklist catches all three recurring environment issues before any WO work begins",
+    "The 10 normative rules in reference_style_guide.md are self-checkable — each has a clear PASS/FAIL test; the compliance checklist at the end of reference_style_guide.md can be reviewed in < 2 minutes per artifact",
+    "The most impactful single rule is Rule 2 (line numbers without commit pins are meaningless) — all source ambiguity incidents in prior sessions traced back to line references without corresponding commit anchors",
+    "confidence score guidance (Rule 9) addresses a previously implicit judgment call — making it explicit enables downstream consumers to weight artifacts by source reliability"
+  ],
+
+  "decisions": [
+    {
+      "id": "DK-1",
+      "decision": "operator_handoff_template.md constrained to < 300 lines",
+      "rationale": "Operator read-through compliance is inversely proportional to document length; critical pre-flight checklist must appear on page 1"
+    },
+    {
+      "id": "DK-2",
+      "decision": "reference_style_guide.md uses DO/DO-NOT pairs for each rule",
+      "rationale": "DO-NOT examples are more memorable than abstract rules; common anti-patterns need explicit naming to be avoidable"
+    },
+    {
+      "id": "DK-3",
+      "decision": "10 normative rules rather than prose guidelines",
+      "rationale": "Numbered rules are referenceable ('Rule 4 violation'); prose guidelines are harder to cite and harder to check"
+    },
+    {
+      "id": "DK-4",
+      "decision": "Confidence score range table instead of single definition",
+      "rationale": "Score calibration varies by source access quality; four-tier table covers the actual range of cases observed: direct file read (0.95), partial read (0.92), inference (0.85)"
+    },
+    {
+      "id": "DK-5",
+      "decision": "Quick-Start section targets exactly 20 minutes with per-step timing",
+      "rationale": "WO success metric is '<20 min to first valid WO'; timing the steps makes the target concrete and self-verifiable"
+    }
+  ],
+
+  "risk_model": [
+    {
+      "id": "R1",
+      "risk": "operators treat reference_style_guide.md as optional reading",
+      "severity": "MEDIUM",
+      "mitigation": "Compliance checklist in §8 is included in operator_handoff_template.md §3; operator_handoff_template.md is the mandatory first read"
+    },
+    {
+      "id": "R2",
+      "risk": "GitHub repo remains private/inaccessible — line number verification impossible for new operators",
+      "severity": "HIGH",
+      "mitigation": "Cached temp files (/tmp/db_ops.md, /tmp/neo4j_manager.py) survive within sessions; pre-flight checklist (Section 0) verifies DB access; source sections summarized in completed WO artifacts serve as offline reference"
+    },
+    {
+      "id": "R3",
+      "risk": "structured_output.json schema evolves — template becomes stale",
+      "severity": "LOW",
+      "mitigation": "template includes schema_version guidance comment; any field addition should add a new WO updating the template"
+    }
+  ],
+
+  "success_metrics": {
+    "onboarding_to_first_valid_wo_target_min": 20,
+    "reference_ambiguity_incidents_target": 0,
+    "report_format_compliance_target_pct": 95,
+    "normative_rules_count": 10,
+    "compliance_checklist_items": 8
+  },
+
+  "cross_wo_dependencies": {
+    "WO-00022": "First WO in this series — established baseline structured_output.json format observed",
+    "WO-00023": "Retry taxonomy language (RETRYABLE/NON_RETRYABLE/ALREADY_SYNCED) used as canonical example in reference guide",
+    "WO-00025": "failure_drill_matrix.csv naming observed — informs snake_case artifact naming rule",
+    "WO-00028": "clickhouse_sink_worker_spec.md naming observed — confirms multi-word snake_case convention",
+    "WO-00029": "neo4j_sync_minimal_subset.md naming observed — confirms same convention"
+  },
+
+  "artifacts": [
+    "report.md",
+    "structured_output.json",
+    "operator_handoff_template.md",
+    "reference_style_guide.md"
+  ],
+
+  "metrics": {
+    "normative_rules": 10,
+    "operator_handoff_sections": 8,
+    "compliance_checklist_items": 8,
+    "quick_start_steps": 5,
+    "environment_issue_table_rows": 6,
+    "do_not_examples_per_rule": 2
+  }
+}
