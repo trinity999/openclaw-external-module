@@ -1,0 +1,132 @@
+{
+  "work_order": "WO-00019",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "description": "Ordered implementation changes by impact × urgency. Complete in order: each item is a prerequisite for the next.",
+
+  "changes": [
+    {
+      "rank": 1,
+      "id": "CHG-001",
+      "title": "Enable SQLite WAL mode",
+      "files_to_change": ["ops/day1/persistence_gateway.py (init block)"],
+      "sql": "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+      "impact": "Unblocks concurrent reads during writes; prevents writer starvation",
+      "urgency": "IMMEDIATE",
+      "effort_h": 0.5,
+      "risk": "LOW",
+      "blocks": ["CHG-002", "CHG-003", "CHG-004"]
+    },
+    {
+      "rank": 2,
+      "id": "CHG-002",
+      "title": "Create chunk_queue table and migrate 51 chunks",
+      "files_to_change": ["ops/day1/persistence_gateway.py", "ops/day1/state/scan_persistence.db"],
+      "sql": "CREATE TABLE IF NOT EXISTS chunk_queue (...); INSERT INTO chunk_queue(chunk_id, chunk_file_path) VALUES ...;",
+      "impact": "Establishes lease-based queue state; one-time migration from file list",
+      "urgency": "IMMEDIATE",
+      "effort_h": 1.0,
+      "risk": "LOW",
+      "blocks": ["CHG-003"]
+    },
+    {
+      "rank": 3,
+      "id": "CHG-003",
+      "title": "Implement grant_lease() with IMMEDIATE isolation",
+      "files_to_change": ["ops/day1/persistence_gateway.py"],
+      "description": "Replace file-list dispatch with atomic lease grant. See report.md Section 2 for full Python implementation.",
+      "impact": "Eliminates duplicate chunk execution (FM-4); provides stuck chunk detection (FM-1)",
+      "urgency": "IMMEDIATE",
+      "effort_h": 2.0,
+      "risk": "MEDIUM",
+      "blocks": ["CHG-005"]
+    },
+    {
+      "rank": 4,
+      "id": "CHG-004",
+      "title": "Create sink_outbox and sink_sync_ledger tables",
+      "files_to_change": ["ops/day1/persistence_gateway.py (init block)", "ops/day1/state/scan_persistence.db"],
+      "sql_ref": "report.md Section 3 — sink_outbox and sink_sync_ledger CREATE TABLE statements",
+      "impact": "Establishes durable record staging; enables replay; enables sync progress tracking",
+      "urgency": "HIGH",
+      "effort_h": 1.0,
+      "risk": "LOW",
+      "blocks": ["CHG-006"]
+    },
+    {
+      "rank": 5,
+      "id": "CHG-005",
+      "title": "Implement heartbeat() and reclaim_expired_leases()",
+      "files_to_change": ["ops/day1/persistence_gateway.py"],
+      "description": "Worker sends heartbeat every 5 min. Orchestrator reclaimer runs every 5 min via cron or background thread.",
+      "impact": "Closes the stuck-chunk detection loop; enables automatic recovery without manual intervention",
+      "urgency": "HIGH",
+      "effort_h": 2.0,
+      "risk": "LOW",
+      "blocks": ["CHG-008"]
+    },
+    {
+      "rank": 6,
+      "id": "CHG-006",
+      "title": "Modify persistence_gateway.py to write to sink_outbox before sink write",
+      "files_to_change": ["ops/day1/persistence_gateway.py"],
+      "description": "Before any ClickHouse/Neo4j write: INSERT INTO sink_outbox(record_id, chunk_id, record_type, payload_json). On sink write success, call _mark_synced(). On failure, leave PENDING for sweep.",
+      "impact": "Makes every scan event durably captured before sink attempt; enables silent failure recovery (FM-2)",
+      "urgency": "HIGH",
+      "effort_h": 3.0,
+      "risk": "MEDIUM",
+      "blocks": ["CHG-007"]
+    },
+    {
+      "rank": 7,
+      "id": "CHG-007",
+      "title": "Implement outbox sweep background thread with retry classification",
+      "files_to_change": ["ops/day1/persistence_gateway.py (new class: OutboxSweeper)"],
+      "description": "30s sweep cycle; batch 1000 records; apply retry classification table (see report.md Section 3). Auth failures halt sweep + emit alert.",
+      "impact": "Eliminates silent sink failures; provides structured retry with storm prevention",
+      "urgency": "HIGH",
+      "effort_h": 4.0,
+      "risk": "MEDIUM",
+      "blocks": ["CHG-008"]
+    },
+    {
+      "rank": 8,
+      "id": "CHG-008",
+      "title": "Implement ConcurrencyController with backpressure signals",
+      "files_to_change": ["ops/day1/run_full_dns_pass.sh (pool size param)", "ops/day1/persistence_gateway.py"],
+      "description": "Read backpressure signals from SQLite; adjust scanner parallelism. Thresholds: depth >10k → -25%; >50k → halt leasing.",
+      "impact": "Prevents unbounded outbox growth during sink degradation; maintains stable operation under load",
+      "urgency": "MEDIUM",
+      "effort_h": 2.0,
+      "risk": "LOW",
+      "blocks": []
+    },
+    {
+      "rank": 9,
+      "id": "CHG-009",
+      "title": "Add master status query as hourly cron output",
+      "files_to_change": ["ops/day1/status_report.sh (new)"],
+      "description": "Run master status SQL query (report.md Section 7) every hour; output to ops channel / log file",
+      "impact": "Immediate pipeline observability; basis for hourly leadership reports",
+      "urgency": "MEDIUM",
+      "effort_h": 1.0,
+      "risk": "LOW",
+      "blocks": []
+    },
+    {
+      "rank": 10,
+      "id": "CHG-010",
+      "title": "Run SLO-1 and SLO-6 drills before production promotion",
+      "files_to_change": [],
+      "description": "SLO-1: Kill worker mid-chunk; restart; verify 0 duplicate rows in sink. SLO-6: Manually expire a lease; verify reclaim within 5 min.",
+      "impact": "Gate verification before full-scale rollout",
+      "urgency": "MEDIUM",
+      "effort_h": 2.0,
+      "risk": "LOW",
+      "blocks": []
+    }
+  ],
+
+  "total_estimated_effort_h": 19.0,
+  "critical_path_h": 14.5,
+  "critical_path": ["CHG-001", "CHG-002", "CHG-003", "CHG-006", "CHG-007"]
+}

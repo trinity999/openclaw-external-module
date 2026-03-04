@@ -1,0 +1,167 @@
+{
+  "work_order": "WO-00019",
+  "category": "architecture",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "confidence": 0.92,
+
+  "key_findings": [
+    "Three root-cause failure modes require three distinct components: (1) file-list dispatch with no lease → stuck chunks (FM-1/FM-4); (2) inline sink write with no outbox → silent sink failures (FM-2); (3) no retry classification → retry storms (FM-3)",
+    "SQLite IMMEDIATE isolation level on lease grants is the minimal-change anti-duplication guarantee — two workers competing for the same chunk serialize; loser sees 0 rows updated and retries without error coordination logic",
+    "UNIQUE constraint on sink_outbox.record_id makes replay idempotent: when sweeper gets a UniqueConstraintViolation from ClickHouse/Neo4j on replay, mark SYNCED not FAILED — record already landed successfully",
+    "Authentication failure (non-retryable config fault) must HALT the sweep loop immediately — not retry — to prevent storm consuming retry budget before root cause is identified; emit alert before halting",
+    "Backpressure threshold at 10k outbox_pending_depth (reduce concurrency 25%) and 50k (halt new leasing) prevents unbounded outbox growth even when sink is degraded",
+    "Sync ledger (sink_sync_ledger table) maintained by trigger on outbox status changes provides O(1) per-chunk sink progress view without full-table aggregation at 10M+ row scale",
+    "Heartbeat-based lease extension (heartbeat every LEASE_DURATION/2) allows short lease duration for fast reclaim on crash while preventing false reclaim of actively-processing chunks",
+    "Master status query (single SQL statement) provides full pipeline observability in <100ms from one SQLite DB — no external monitoring stack required for operations"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "SQLite as single authoritative state store for both queue and outbox",
+      "summary": "Chunk queue and sink outbox live in same SQLite DB; atomic cross-table transactions possible",
+      "rationale": "Atomic chunk ack + outbox insert in single transaction prevents the gap where a chunk is marked COMPLETED but its records are not yet queued for sync. An external coordinator (Redis) would require a distributed commit across two systems.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "Lease with heartbeat extension over fixed long lease",
+      "summary": "Short lease (10 min) extended via periodic heartbeat; expired leases reclaimed within one reclaim cycle (5 min)",
+      "rationale": "A fixed 4-hour lease to accommodate slow chunks means a crashed worker leaves a chunk unreachable for 4 hours. Heartbeat + short lease means reclaim happens within 5 min of worker death regardless of chunk size.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "Outbox sweep in separate thread over inline sink write",
+      "summary": "Scanner writes to outbox synchronously; separate sweep thread handles sink writes asynchronously",
+      "rationale": "Inline sync blocks the scan worker on sink latency (up to seconds per record at ClickHouse). Sweep decouples scan throughput from sink throughput. Scan can continue at full speed while sink catches up.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "Auth failure halts sweep with alert; no retry",
+      "summary": "Non-retryable config faults (wrong credentials, schema mismatch) halt sweep loop immediately",
+      "rationale": "Retrying auth failures consumes all retry budget in seconds and triggers alert spam that masks the real issue. Halt + single alert forces immediate operator investigation of the root cause.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "Dual backpressure thresholds (10k reduce / 50k halt) over single threshold",
+      "summary": "10k pending triggers concurrency reduction; 50k pending triggers lease halt for full outbox drain",
+      "rationale": "Single threshold is binary (full speed or zero). Dual threshold gives graduated response: reduce first (may be sufficient), halt only if reduction doesn't recover sink lag within the threshold band.",
+      "stability_impact": "high_positive"
+    }
+  ],
+
+  "components": [
+    {
+      "id": "C1",
+      "name": "Chunk Lease/Ack Queue",
+      "table": "chunk_queue",
+      "state_machine": ["PENDING", "LEASED", "COMPLETED", "FAILED_RETRYABLE", "FAILED_PERMANENT"],
+      "key_operations": ["grant_lease", "heartbeat", "ack_chunk", "reclaim_expired_leases"],
+      "isolation_level": "IMMEDIATE",
+      "lease_duration_sec": 600,
+      "heartbeat_interval_sec": 300,
+      "reclaim_cycle_sec": 300,
+      "max_retries_default": 3
+    },
+    {
+      "id": "C2",
+      "name": "Sink Outbox + Sync Ledger",
+      "tables": ["sink_outbox", "sink_sync_ledger"],
+      "state_machine": ["PENDING", "SYNCED", "FAILED_RETRYABLE", "DEAD_LETTER"],
+      "sweep_interval_sec": 30,
+      "sweep_batch_size": 1000,
+      "max_sync_attempts_default": 5,
+      "idempotency_mechanism": "UNIQUE constraint on record_id; UniqueConstraintViolation → SYNCED"
+    },
+    {
+      "id": "C3",
+      "name": "Backpressure Controller",
+      "signals": [
+        {"name": "outbox_pending_depth", "warn_threshold": 10000, "critical_threshold": 50000},
+        {"name": "sink_oldest_pending_age_h", "warn_threshold": 2.0},
+        {"name": "dead_letter_rate_pct", "warn_threshold": 2.0},
+        {"name": "stale_lease_count", "warn_threshold": 0},
+        {"name": "chunk_completion_gap_min", "warn_threshold": 30}
+      ],
+      "actions": {
+        "depth_warn": "reduce scanner parallelism by 25%",
+        "depth_critical": "halt new chunk leasing; drain outbox",
+        "oldest_pending_warn": "reduce concurrency by 50% + alert",
+        "auth_failure": "halt sweep + alert + no retry"
+      }
+    }
+  ],
+
+  "retry_classification": [
+    {"error_type": "connection_timeout", "class": "RETRYABLE", "max_retries": 5, "backoff": "exponential_2x"},
+    {"error_type": "rate_limit_429", "class": "RETRYABLE", "max_retries": 5, "backoff": "30s_60s_120s_240s_480s"},
+    {"error_type": "connection_refused", "class": "RETRYABLE", "max_retries": 10, "backoff": "30s_fixed"},
+    {"error_type": "neo4j_transient", "class": "RETRYABLE", "max_retries": 5, "backoff": "exponential_2x"},
+    {"error_type": "schema_validation_failure", "class": "NON_RETRYABLE", "action": "DEAD_LETTER"},
+    {"error_type": "unique_constraint_violation", "class": "NON_RETRYABLE", "action": "SYNCED"},
+    {"error_type": "auth_failure", "class": "NON_RETRYABLE", "action": "DEAD_LETTER + halt_sweep + alert"},
+    {"error_type": "record_parse_error", "class": "NON_RETRYABLE", "action": "DEAD_LETTER"},
+    {"error_type": "sink_schema_mismatch", "class": "NON_RETRYABLE", "action": "DEAD_LETTER + alert"}
+  ],
+
+  "integrity_slos": [
+    {"id": "SLO-1", "metric": "duplicate_chunk_execution", "threshold": 0, "verification": "restart drill; audit log check"},
+    {"id": "SLO-2", "metric": "sink_unsynced_oldest_age_h", "threshold": 2.0, "verification": "monitor 1h under normal ops"},
+    {"id": "SLO-3", "metric": "replay_duplicate_rate_pct", "threshold": 0.1, "verification": "replay completed chunk; compare row counts"},
+    {"id": "SLO-4", "metric": "queue_completion_gap_min", "threshold": 30, "verification": "monitor across full 51-chunk run"},
+    {"id": "SLO-5", "metric": "dead_letter_rate_pct", "threshold": 1.0, "verification": "monitor 2h of operation"},
+    {"id": "SLO-6", "metric": "lease_reclaim_correctness_pct", "threshold": 100, "verification": "inject stale lease; verify reclaim within 5 min"},
+    {"id": "SLO-7", "metric": "auth_failure_halt", "threshold": 1, "verification": "inject bad credentials; verify sweep halts"}
+  ],
+
+  "risk_model": [
+    {"id": "R1", "title": "SQLite WAL writer contention at high ingest rate", "severity": "HIGH", "probability": "MEDIUM", "mitigation": "WAL mode; batch writes per chunk; PRAGMA synchronous=NORMAL"},
+    {"id": "R2", "title": "Sweep falls behind; outbox grows unboundedly", "severity": "HIGH", "probability": "LOW", "mitigation": "Backpressure halts leasing at depth >50k; sweep batches 1000/cycle"},
+    {"id": "R3", "title": "Auth failure causes retry storm", "severity": "HIGH", "probability": "LOW", "mitigation": "Auth failures halt sweep immediately; no retry; single alert"},
+    {"id": "R4", "title": "Lease too short for large chunks", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Heartbeat every LEASE_DURATION/2; adjustable per chunk size profile"},
+    {"id": "R5", "title": "Outbox exceeds SQLite scalability", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Archive SYNCED records older than 7 days to sink_outbox_archive"},
+    {"id": "R6", "title": "Scanner restart loses heartbeat state", "severity": "LOW", "probability": "HIGH", "mitigation": "Heartbeats resume on restart; reclaimer handles stale within 5 min"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Enable SQLite WAL mode: PRAGMA journal_mode=WAL — required before any concurrent writes"},
+    {"priority": 2, "id": "REC-02", "action": "Initialize chunk_queue table with 51 chunk rows from existing file list (one-time migration)"},
+    {"priority": 3, "id": "REC-03", "action": "Implement grant_lease() with IMMEDIATE isolation in persistence_gateway.py — eliminates duplicate chunk execution"},
+    {"priority": 4, "id": "REC-04", "action": "Create sink_outbox table and implement outbox insert in persistence_gateway.py before any sink write"},
+    {"priority": 5, "id": "REC-05", "action": "Implement outbox sweep as background thread with 30s interval and retry classification table"},
+    {"priority": 6, "id": "REC-06", "action": "Wire backpressure signals to scanner concurrency controller: depth >10k → reduce 25%; >50k → halt leasing"},
+    {"priority": 7, "id": "REC-07", "action": "Run SLO-1 drill (restart mid-chunk) before promoting to production — must show 0 duplicate rows"},
+    {"priority": 8, "id": "REC-08", "action": "Deploy master status query as hourly cron output to ops channel — immediate pipeline observability"}
+  ],
+
+  "metrics": {
+    "chunk_count": 51,
+    "asset_count_M": 10,
+    "lease_duration_sec": 600,
+    "heartbeat_interval_sec": 300,
+    "reclaim_cycle_sec": 300,
+    "sweep_interval_sec": 30,
+    "sweep_batch_size": 1000,
+    "max_sync_attempts": 5,
+    "max_retries_chunk": 3,
+    "backpressure_warn_depth": 10000,
+    "backpressure_critical_depth": 50000,
+    "slo_sink_age_h": 2.0,
+    "slo_queue_gap_min": 30,
+    "slo_replay_duplicate_pct": 0.1,
+    "slo_dead_letter_pct": 1.0
+  },
+
+  "assumptions": [
+    "A1: SQLite WAL mode will be enabled before first write",
+    "A2: persistence_gateway.py can be extended to accept chunk_id and worker_id for lease integration",
+    "A3: Scanner concurrency is controlled by a configurable pool size parameter",
+    "A4: 51 chunks pre-populated in chunk_queue at initialization",
+    "A5: ClickHouse/Neo4j clients raise distinct exception classes for retryable vs non-retryable errors",
+    "A6: audit log table (chunk_queue_audit_log) maintained by trigger for SLO-1 verification"
+  ]
+}
