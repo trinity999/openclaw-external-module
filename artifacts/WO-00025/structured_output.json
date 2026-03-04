@@ -1,0 +1,100 @@
+{
+  "work_order": "WO-00025",
+  "category": "testing",
+  "priority": "high",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-05T00:00:00Z",
+  "source_commit": "trinity999/Pandavs-Framework@cebd2d5",
+  "confidence": 0.93,
+
+  "key_findings": [
+    "INSERT OR IGNORE in persistence_gateway.py insert_event() makes persistence re-runs naturally idempotent — FM-04 drill proves this with before/after COUNT(*) comparison",
+    "The most severe data loss risk is FM-17 (WAL corruption): maximum loss is one ingest_file() call worth of uncommitted events. All other drills produce zero data loss.",
+    "ClickHouse health check must gate batch claiming — during outage, rows must stay PENDING (not FAILED) to avoid false retry_count increments and spurious DLQ escalation",
+    "All recovery mechanisms already exist in WO-00022/WO-00023 infrastructure: lease reaper, claim reaper, outbox retry, DLQ promotion. Drills verify these work correctly end-to-end.",
+    "MTTR < 15 min is achievable for all automated recovery drills. Manual intervention drills (FM-08, FM-10) depend on operator following DATABASE_OPS.md runbooks.",
+    "FM-20 (concurrent load drill) is the most important pre-production drill — it validates the WAL mode concurrent access assumption and hourly report monotonicity under realistic conditions."
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "Use SIGKILL (not SIGTERM) for all process kill drills",
+      "rationale": "SIGKILL simulates OOM/kernel kill — the actual failure mode in production; SIGTERM with graceful cleanup would not exercise the reaper/recovery path"
+    },
+    {
+      "id": "D2",
+      "decision": "Pre/post snapshot queries run inside SQLite (no external tools)",
+      "rationale": "Self-contained harness; SQLite is the single source of truth; snapshot queries are the same queries used in WO-00024 hourly report"
+    },
+    {
+      "id": "D3",
+      "decision": "FM-17 (WAL corruption) runs on a copy of the DB",
+      "rationale": "Truncating WAL is irreversible on the original DB; drill validates SQLite durability semantics without production risk"
+    },
+    {
+      "id": "D4",
+      "decision": "20 drills organized in 6 sections with independent pass/fail gates",
+      "rationale": "Allows partial rollout approval (e.g., proceed with ClickHouse sink while Neo4j drill is pending); clear mandatory vs advisory classification"
+    }
+  ],
+
+  "drill_summary": {
+    "total_drills": 20,
+    "mandatory_drills": 11,
+    "recommended_drills": 7,
+    "advisory_drills": 2,
+    "stages_covered": ["scanner", "persistence", "clickhouse_sink", "neo4j_sink", "cross_stage", "backlog_drain"],
+    "failure_modes": ["SIGKILL", "disk_full", "db_outage", "auth_failure", "type_mismatch", "memory_limit", "wal_corruption", "container_restart", "replay_duplicate"]
+  },
+
+  "success_metrics": {
+    "mttr_target_s": 900,
+    "unrecoverable_event_loss_target": 0,
+    "replay_duplicate_rate_target_pct": 0.1,
+    "drill_suite_execution_time_h": 4,
+    "first_run_pass_rate_target_pct": 80
+  },
+
+  "risk_model": [
+    {
+      "id": "R1",
+      "risk": "FM-17 WAL corruption drill damages production DB",
+      "severity": "HIGH",
+      "mitigation": "Always run on copy: `cp scan_persistence.db /tmp/drill_copy.db`"
+    },
+    {
+      "id": "R2",
+      "risk": "CH health check gate not implemented in sink worker — rows marked FAILED during outage",
+      "severity": "HIGH",
+      "mitigation": "WO-00028 spec includes explicit health check before batch claim; FM-08 verifies this behavior"
+    },
+    {
+      "id": "R3",
+      "risk": "FM-20 concurrent drill exposes SQLITE_BUSY under high contention",
+      "severity": "MEDIUM",
+      "mitigation": "WAL mode supports concurrent reads + one writer; BEGIN IMMEDIATE serializes write attempts; if SQLITE_BUSY observed, increase SQLite timeout parameter"
+    }
+  ],
+
+  "recommended_actions": [
+    "Run Section A + B drills first (scanner + persistence) — these are infrastructure prerequisites for all other drills",
+    "Run FM-08 (CH outage) before any ClickHouse sink deployment to verify health-check gate behavior",
+    "Run FM-19 (replay idempotency) as a regression drill after every schema or worker change",
+    "Run FM-20 (concurrent load) as the final gate before production rollout"
+  ],
+
+  "cross_wo_dependencies": {
+    "WO-00022": "chunk_queue + reclaim_stale_leases() required for Section A drills",
+    "WO-00023": "sink_outbox + dead_letter_events required for Section C/D drills",
+    "WO-00024": "ALT-03 alert fired in FM-10 drill; ALT-02 alert fired in FM-06 drill",
+    "WO-00028": "clickhouse_sink_worker.py CLAIMED status + reaper required for FM-09"
+  },
+
+  "metrics": {
+    "total_drills": 20,
+    "csv_rows": 20,
+    "checklist_sections": 6,
+    "mandatory_gate_items": 11
+  }
+}
