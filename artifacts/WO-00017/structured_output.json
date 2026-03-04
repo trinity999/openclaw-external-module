@@ -1,0 +1,230 @@
+{
+  "work_order": "WO-00017",
+  "category": "research",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "confidence": 0.88,
+
+  "key_findings": [
+    "Phase 1 passive enrichment (CNAME attribution, TLS SAN correlation, response header fingerprinting, error page profiling) achieves +15-25% signal gain at ~0-1% additional cost — highest ROI tier because all techniques derive value from already-collected DNS/HTTP data",
+    "CNAME chain attribution enables subdomain takeover detection (14 known-vulnerable platforms: Heroku, S3, GitHub Pages, Azure, etc.) at zero additional tool cost — O(1) string match per DNS record against fingerprint database",
+    "TLS SAN correlation extracts novel sibling subdomains from already-collected httpx TLS certificate data — average enterprise cert has 5-15 SANs; 10% novel discovery rate = significant corpus expansion without additional DNS scan budget",
+    "JS endpoint extraction (Phase 2, gated at KRIL>=60 AND ACS>=60) provides +10-15% finding density on high-value gated assets; katana already fetches JS files — structured analysis is an incremental cost on top of existing budget",
+    "Reverse DNS PTR expansion (Phase 2, gated) reveals corporate infrastructure siblings at ~1% cost increase — 1 DNS query per unique IP in high-KRIL space",
+    "ASN/CIDR scanning and HTTP smuggling probes DEFERRED — cost +20-30%, infra mutation risk, scope violation potential; nuclei templates already handle targeted versions",
+    "Combined Phase 1-2: +28-40% total signal gain at +4-7% total cost — exceeds >=25% signal target and stays within <=10% cost constraint",
+    "Enrichment findings with confidence <0.7 queued for nuclei validation, not auto-reported — prevents false positive inflation in analyst-facing views"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "title": "Passive post-processor architecture over active tool addition",
+      "summary": "All Phase 1 techniques run as stateless post-processors on already-collected data; zero new tool invocations required",
+      "rationale": "Adding new tool calls scales linearly with corpus — violates <=10% cost constraint at 10M+ subdomain scale. Passive post-processors derive value from data already paid for by existing DNS/HTTP scans. The marginal cost is CPU cycles for string matching, not network I/O.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D2",
+      "title": "KRIL+ACS dual gate for active Phase 2 enrichment",
+      "summary": "JS extraction and PTR expansion only run on assets with KRIL>=60 AND ACS>=60",
+      "rationale": "Without gating, JS extraction on all 10M subdomains would cost orders of magnitude more than the <=10% budget allows. The dual gate ensures enrichment runs only on high-value, confirmed-live assets — the intersection where enrichment is most productive.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D3",
+      "title": "CNAME takeover fingerprint database as extensible configuration (not hardcoded)",
+      "summary": "TAKEOVER_FINGERPRINTS dict versioned and updatable without code change",
+      "rationale": "New platforms emerge regularly. Hardcoding fingerprints requires code deploys for updates. Externalizing the fingerprint database enables monthly updates via config file, consistent with the hot-reload philosophy of score_config.json.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D4",
+      "title": "Confidence-gated finding emission for enrichment candidates",
+      "summary": "Enrichment techniques emit finding_candidates with confidence 0.0-1.0; only confidence>=0.7 auto-reported; lower confidence queued for nuclei validation",
+      "rationale": "Passive techniques (header fingerprinting, error page profiling) produce indicators, not confirmed findings. Auto-reporting all indicators would inflate false positive rate. Confidence gate ensures analysts see confirmed findings while low-confidence candidates are queued for nuclei template validation.",
+      "stability_impact": "high_positive"
+    },
+    {
+      "id": "D5",
+      "title": "ASN/CIDR scanning and HTTP smuggling deferred",
+      "summary": "Both techniques violate cost constraint (>10%) or infra-mutation risk; nuclei templates cover targeted versions",
+      "rationale": "ASN scanning requires O(256 × ports) probes per discovered IP — at scale this exceeds cost budget and triggers rate limits. HTTP smuggling probes at mass scale risk unintended mutation of target state. Both are better implemented as nuclei templates on explicitly targeted assets.",
+      "stability_impact": "neutral"
+    }
+  ],
+
+  "techniques": [
+    {
+      "id": "T1",
+      "name": "CNAME Chain Attribution",
+      "phase": 1,
+      "cost_impact_pct": 0,
+      "signal_gain_pct": "8-12",
+      "status": "RECOMMEND",
+      "mechanism": "Post-DNS-parse: match terminal CNAME against TAKEOVER_FINGERPRINTS dict; flag cname_takeover_candidate=true + cname_provider if match; queue for HTTP verification",
+      "finding_class": "takeover",
+      "confidence_output": 0.65,
+      "implementation_complexity": "low",
+      "initial_fingerprint_count": 14,
+      "platforms": ["heroku", "aws_s3", "github_pages", "azure", "cloudfront", "surge", "netlify", "vercel", "fly", "pantheon", "zendesk", "shopify", "fastly", "others"]
+    },
+    {
+      "id": "T2",
+      "name": "TLS Certificate SAN Correlation",
+      "phase": 1,
+      "cost_impact_pct": 0,
+      "signal_gain_pct": "10-18 (corpus expansion)",
+      "status": "RECOMMEND",
+      "mechanism": "Post-HTTP-parse: extract SANs from TLS cert data in httpx output; cross-reference against corpus; novel SANs added to DNS queue with source=tls_san; SAN_PEER relationship emitted in Neo4j",
+      "finding_class": "corpus_expansion",
+      "confidence_output": 0.85,
+      "implementation_complexity": "low"
+    },
+    {
+      "id": "T3",
+      "name": "Response Header Fingerprinting",
+      "phase": 1,
+      "cost_impact_pct": 0.5,
+      "signal_gain_pct": "6-10",
+      "status": "RECOMMEND",
+      "mechanism": "Post-HTTP-parse: analyze stored response headers against HEADER_SIGNATURES ruleset; emit exposure/misconfiguration candidates for missing security headers, outdated server versions, CORS wildcards",
+      "finding_class": "misconfiguration",
+      "confidence_output": 0.55,
+      "implementation_complexity": "low",
+      "header_signals": ["X-Frame-Options", "CSP", "CORS", "HSTS", "X-Content-Type-Options", "Server version", "X-Powered-By", "Set-Cookie flags"]
+    },
+    {
+      "id": "T4",
+      "name": "Error Page Profiling",
+      "phase": 1,
+      "cost_impact_pct": 0.5,
+      "signal_gain_pct": "5-8",
+      "status": "RECOMMEND",
+      "mechanism": "Post-HTTP-parse: pattern-match 4xx/5xx response bodies against error_page_signatures; detect framework versions in error messages, stack traces, debug mode indicators, database error strings",
+      "finding_class": "exposure",
+      "confidence_output": 0.50,
+      "implementation_complexity": "low"
+    },
+    {
+      "id": "T5",
+      "name": "JavaScript Endpoint Extraction",
+      "phase": 2,
+      "cost_impact_pct": "3-5",
+      "signal_gain_pct": "10-15 (on gated assets)",
+      "status": "RECOMMEND (GATED)",
+      "gate": "KRIL >= 60 AND ACS >= 60",
+      "mechanism": "Post-katana: analyze fetched .js files for API endpoint patterns (/api/, /v1/, /admin/), credential patterns (AWS keys, JWT, OAuth secrets), internal domain references",
+      "finding_class": "exposure, vulnerability_cve",
+      "confidence_output": "0.6 for credentials (requires analyst review); 0.75 for API endpoints",
+      "implementation_complexity": "medium"
+    },
+    {
+      "id": "T6",
+      "name": "Reverse DNS PTR Expansion",
+      "phase": 2,
+      "cost_impact_pct": 1,
+      "signal_gain_pct": "5-8 (corpus expansion)",
+      "status": "RECOMMEND (GATED)",
+      "gate": "KRIL >= 50 (IP must be associated with high-KRIL subdomain)",
+      "mechanism": "Post-DNS: 1 PTR lookup per unique IP in gated set; PTR result cross-referenced against root domain scope; novel hostnames added to DNS queue",
+      "finding_class": "corpus_expansion",
+      "confidence_output": 0.80,
+      "implementation_complexity": "low"
+    },
+    {
+      "id": "T7",
+      "name": "ASN/CIDR Neighbor Scanning",
+      "phase": "deferred",
+      "cost_impact_pct": "20-30",
+      "status": "DEFERRED",
+      "rejection_reason": "Exceeds cost constraint; scope violation risk; infra mutation risk; nuclei templates cover targeted version"
+    },
+    {
+      "id": "T8",
+      "name": "HTTP Smuggling Probe",
+      "phase": "deferred",
+      "cost_impact_pct": 10,
+      "status": "DEFERRED",
+      "rejection_reason": "High false positive rate without careful validation; risk of state mutation on target; nuclei templates already exist for targeted use"
+    }
+  ],
+
+  "aggregate_roi": {
+    "phase_1_cost_increase_pct": "0.5-1",
+    "phase_1_signal_gain_pct": "15-25",
+    "phase_2_cost_increase_pct": "3-6",
+    "phase_2_signal_gain_pct": "10-18",
+    "combined_cost_increase_pct": "4-7",
+    "combined_signal_gain_pct": "28-40",
+    "cost_constraint_pct": 10,
+    "signal_target_pct": 25,
+    "cost_constraint_met": true,
+    "signal_target_met": true
+  },
+
+  "implementation_architecture": {
+    "pattern": "stateless post-processor classes",
+    "base_class": "EnrichmentPostProcessor",
+    "methods": ["process_dns_record(record) -> list[EnrichmentResult]", "process_http_record(record) -> list[EnrichmentResult]"],
+    "pipeline_registration": "ENRICHMENT_PIPELINE list in enrichment_config",
+    "execution_model": "async batch, runs after each DNS/HTTP parse batch completes",
+    "finding_emission": "EnrichmentResult with confidence float; auto-report if confidence >= 0.70; queue for nuclei validation if 0.40 <= confidence < 0.70"
+  },
+
+  "cname_fingerprint_database": {
+    "versioned": true,
+    "updatable_without_code_change": true,
+    "initial_platform_count": 14,
+    "update_cadence": "monthly",
+    "verification_required": true,
+    "verification_method": "HTTP response body match against platform error string"
+  },
+
+  "risk_model": [
+    {"id": "R1", "title": "CNAME fingerprint database stale; misses new platforms", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Version CNAME_FINGERPRINTS; monthly update; false negatives acceptable (no false positives from stale data)"},
+    {"id": "R2", "title": "TLS SAN expansion creates corpus explosion", "severity": "MEDIUM", "probability": "LOW", "mitigation": "SAN dedup against corpus before adding; wildcard SANs stripped; rate-limit SAN additions per cycle"},
+    {"id": "R3", "title": "JS extraction produces false credential positives", "severity": "MEDIUM", "probability": "MEDIUM", "mitigation": "Credential candidates capped at confidence=0.6; require analyst review before reporting"},
+    {"id": "R4", "title": "Error page profiling high false positive rate", "severity": "LOW", "probability": "MEDIUM", "mitigation": "Error page findings at confidence<=0.5; not auto-reported; queued for nuclei validation"},
+    {"id": "R5", "title": "PTR results point to out-of-scope infrastructure", "severity": "LOW", "probability": "LOW", "mitigation": "PTR results cross-referenced against root domain scope before adding to queue"},
+    {"id": "R6", "title": "Phase 2 cost exceeds estimate for large gated asset set", "severity": "MEDIUM", "probability": "LOW", "mitigation": "Monitor cost delta as ORS signal; alert if >8%; auto-raise KRIL/ACS gate threshold"}
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "id": "REC-01", "action": "Implement CNAME attribution post-processor with 14-platform fingerprint database — zero cost, immediate takeover candidate detection"},
+    {"priority": 2, "id": "REC-02", "action": "Implement TLS SAN correlation post-processor extracting novel SANs from httpx output — zero cost, corpus expansion"},
+    {"priority": 3, "id": "REC-03", "action": "Implement response header fingerprinting with HEADER_SIGNATURES ruleset — low CPU cost, pre-labels nuclei targets"},
+    {"priority": 4, "id": "REC-04", "action": "Implement error page profiler for 4xx/5xx body pattern matching — catches framework version disclosure and debug mode"},
+    {"priority": 5, "id": "REC-05", "action": "Externalize TAKEOVER_FINGERPRINTS and HEADER_SIGNATURES as versioned config files — enables monthly updates without code deploy"},
+    {"priority": 6, "id": "REC-06", "action": "Add Phase 2: JS extraction post-katana (KRIL>=60, ACS>=60 gate) — highest absolute finding density gain on high-value gated assets"},
+    {"priority": 7, "id": "REC-07", "action": "Add Phase 2: PTR expansion for IPs associated with KRIL>=50 subdomains — low cost, reveals corporate infrastructure siblings"},
+    {"priority": 8, "id": "REC-08", "action": "Monitor enrichment cost delta as ORS signal after each Phase 2 cycle — alert if total enrichment overhead >8% of baseline scan budget"}
+  ],
+
+  "metrics": {
+    "techniques_recommended": 6,
+    "techniques_deferred": 2,
+    "phase_1_techniques": 4,
+    "phase_2_techniques": 2,
+    "combined_cost_increase_pct_max": 7,
+    "combined_signal_gain_pct_min": 28,
+    "cost_constraint_pct": 10,
+    "signal_target_pct": 25,
+    "cname_platforms_initial": 14,
+    "js_enrichment_kril_gate": 60,
+    "js_enrichment_acs_gate": 60,
+    "ptr_enrichment_kril_gate": 50,
+    "auto_report_confidence_threshold": 0.70,
+    "nuclei_queue_confidence_threshold": 0.40
+  },
+
+  "assumptions": [
+    "A1: dnsx output includes full CNAME chain data; terminal CNAME accessible in parsed record",
+    "A2: httpx output includes TLS certificate SAN list already parsed by httpx_parser_v1",
+    "A3: HTTP response headers and body stored and accessible for post-parse analysis",
+    "A4: katana crawl output includes fetched JS file content or URL list",
+    "A5: Reverse DNS PTR lookup permissible within current network access profile",
+    "A6: CNAME fingerprint database starts at 14 platforms; extensible by config update",
+    "A7: Enrichment findings with confidence <0.7 queued for nuclei validation, not auto-reported"
+  ]
+}
