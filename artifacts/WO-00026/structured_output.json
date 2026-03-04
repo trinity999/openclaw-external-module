@@ -1,0 +1,111 @@
+{
+  "work_order": "WO-00026",
+  "category": "performance",
+  "priority": "high",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-05T00:00:00Z",
+  "source_commit": "trinity999/Pandavs-Framework@cebd2d5",
+  "confidence": 0.91,
+
+  "key_findings": [
+    "PARALLEL is already env-overridable via `PARALLEL=${PARALLEL:-48}` (line 4 of run_full_dns_pass.sh) — the controller writes to a setting file and the scanner reads it at chunk boundaries; only 4 lines of modification needed to the scanner",
+    "All four required control signals (error rate, ingest lag, sink lag, chunk completion rate) are already present in scan_persistence.db — zero new instrumentation needed",
+    "chunk_completion_rate_h is the most important signal for no-progress detection; when zero for 10+ minutes it directly feeds WO-00024 ALT-01 alert and also triggers the most aggressive PARALLEL reduction",
+    "Anti-flap mechanism (max 8 adjustments/hour + green streak of 3 before increase) prevents oscillation between PARALLEL values — critical given 5-minute eval interval",
+    "Atomic file write (os.replace on POSIX) ensures scanner never reads a partial PARALLEL value at chunk boundary",
+    "Controller failure (crash/exception) leaves PARALLEL_SETTING file with last known value — scanner fallback is implicit (reads the file or uses original env var default)"
+  ],
+
+  "decisions": [
+    {
+      "id": "DD-1",
+      "decision": "Setting file (not env var injection) for PARALLEL value",
+      "rationale": "File persists across controller restarts; env var would require process substitution or sourcing into scanner's shell environment"
+    },
+    {
+      "id": "DD-2",
+      "decision": "4 signals from SQLite (no log file parsing)",
+      "rationale": "SQLite queries are sub-millisecond on warm cache; log parsing adds fragility; all signals already computed in WO-00024 monitoring queries"
+    },
+    {
+      "id": "DD-3",
+      "decision": "Decrease factor 0.75, increase factor 1.20 (asymmetric)",
+      "rationale": "Safety asymmetry: faster to reduce (protect resolvers) than to increase (prevent overshoot); matches principle of conservative scale-up"
+    },
+    {
+      "id": "DD-4",
+      "decision": "Green streak of 3 required before increase",
+      "rationale": "15-minute stability window ensures signal improvement is sustained, not a transient spike"
+    }
+  ],
+
+  "controller": {
+    "file": "adaptive_controller.py",
+    "eval_interval_s": 300,
+    "parallel_default": 48,
+    "parallel_min": 4,
+    "parallel_max": 96,
+    "rules": ["R1_error_rate_red", "R2_ingest_lag_red", "R3_sink_lag_hold", "R4_no_progress_50pct", "R5_no_progress_emergency", "R6_green_streak_increase", "R7_yellow_hold"],
+    "anti_flap_max_per_hour": 8,
+    "green_streak_required": 3,
+    "signals": ["chunk_error_rate_h", "ingest_lag_s", "sink_lag_h", "chunk_completion_rate_h"]
+  },
+
+  "scanner_patch": {
+    "file": "run_full_dns_pass.sh",
+    "lines_changed": 4,
+    "location": "inside while loop before xargs call",
+    "backward_compatible": true,
+    "fallback": "if setting file absent, uses original PARALLEL env var"
+  },
+
+  "success_metrics": {
+    "chunk_completion_variance_reduction_pct": 20,
+    "no_progress_windows_gt_30min_target": 0,
+    "resolver_error_burst_reduction_pct": 25,
+    "parallel_steady_state_expected_range": [32, 64],
+    "controller_eval_overhead_ms_max": 100
+  },
+
+  "risk_model": [
+    {
+      "id": "R1",
+      "risk": "Controller reduces PARALLEL too aggressively; scan stalls",
+      "severity": "MEDIUM",
+      "mitigation": "PARALLEL_MIN=4 floor; ALT-01 fires after 30min no progress"
+    },
+    {
+      "id": "R2",
+      "risk": "chunk_error_rate_h unreliable if lines_in=0 (empty chunk files)",
+      "severity": "LOW",
+      "mitigation": "NULLIF(SUM(lines_in),0) returns NULL; null_behavior=green prevents false RED"
+    },
+    {
+      "id": "R3",
+      "risk": "Race between controller write and scanner read at chunk boundary",
+      "severity": "NEGLIGIBLE",
+      "mitigation": "os.replace is atomic; scanner reads integer — partial reads impossible"
+    }
+  ],
+
+  "recommended_actions": [
+    "Deploy adaptive_controller.py with `nice -n 15` to minimize CPU impact on scanner",
+    "Apply 4-line patch to run_full_dns_pass.sh (reads state/parallel_setting.txt at chunk boundary)",
+    "Monitor logs/parallel_history.csv for first 2 hours to validate controller behavior",
+    "Run baseline (1 chunk at PARALLEL=48) before deploying to measure variance for comparison"
+  ],
+
+  "cross_wo_dependencies": {
+    "WO-00022": "chunk_queue.lines_in/lines_out and completed_at timestamps required for chunk_error_rate_h and chunk_completion_rate_h signals",
+    "WO-00023": "sink_outbox.created_at required for sink_lag_h signal",
+    "WO-00024": "chunk_completion_rate_h=0 feeds ALT-01; sink_lag_h feeds ALT-04; no_progress_evals>=6 same trigger as ALT-01"
+  },
+
+  "metrics": {
+    "signals_count": 4,
+    "rules_count": 7,
+    "scanner_lines_changed": 4,
+    "new_files": 3,
+    "tuning_parameters": 8
+  }
+}

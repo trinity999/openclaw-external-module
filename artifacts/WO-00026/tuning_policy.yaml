@@ -1,0 +1,166 @@
+# Pandavs Adaptive Concurrency Tuning Policy
+# Work Order: WO-00026 | Source: trinity999/Pandavs-Framework@cebd2d5
+# Version: 1.0
+#
+# This file is consumed by adaptive_controller.py.
+# The controller reads signals from scan_persistence.db and writes
+# PARALLEL value to state/parallel_setting.txt for the scanner to pick up.
+
+meta:
+  policy_version: "1.0"
+  pipeline: pandavs-day1
+  db: state/scan_persistence.db
+  parallel_setting_file: state/parallel_setting.txt
+  eval_interval_s: 300        # evaluate every 5 minutes
+
+# ─── Concurrency Bounds ───────────────────────────────────────────────────────
+
+concurrency:
+  default: 48                 # initial PARALLEL value (matches hardcoded default)
+  min: 4                      # never go below — always maintain forward progress
+  max: 96                     # hard ceiling — avoid over-saturating DNS resolvers
+  step_up_factor: 1.20        # increase by 20% per step
+  step_down_factor: 0.75      # decrease by 25% per step
+  step_down_no_progress: 0.50 # decrease by 50% if no chunks completing
+
+# ─── Signal Thresholds ────────────────────────────────────────────────────────
+# Each signal has GREEN/YELLOW/RED zones.
+# GREEN: healthy; YELLOW: watch; RED: take action
+
+signals:
+
+  # Signal 1: DNS error rate (% of input lines that produced no answer)
+  # Source: chunk_queue lines_in vs lines_out for recently completed chunks
+  chunk_error_rate_h:
+    description: "Percentage of DNS queries that returned no result in last 1h"
+    unit: percent
+    query: |
+      SELECT ROUND(
+          100.0 * SUM(lines_in - lines_out) / NULLIF(SUM(lines_in), 0),
+      2) AS chunk_error_rate_h
+      FROM chunk_queue
+      WHERE status = 'COMPLETED'
+        AND completed_at >= datetime('now', '-1 hour')
+    zones:
+      green:  { max: 5.0 }
+      yellow: { min: 5.0, max: 15.0 }
+      red:    { min: 15.0 }
+    null_behavior: green      # no data = no errors yet = treat as green
+
+  # Signal 2: Persistence gateway ingest lag
+  # Source: files table — how stale are pending result files
+  ingest_lag_s:
+    description: "Seconds since persistence gateway last processed pending result files"
+    unit: seconds
+    query: |
+      SELECT ROUND(
+          AVG((julianday('now') - julianday(last_seen_ts)) * 86400.0)
+      ) AS ingest_lag_s
+      FROM files
+      WHERE status = 'pending'
+    zones:
+      green:  { max: 120 }
+      yellow: { min: 120, max: 300 }
+      red:    { min: 300 }
+    null_behavior: green      # no pending files = gateway caught up = green
+
+  # Signal 3: Sink outbox backlog age
+  # Source: sink_outbox — oldest unsent event to ClickHouse or Neo4j
+  sink_lag_h:
+    description: "Age in hours of oldest PENDING/FAILED outbox entry"
+    unit: hours
+    query: |
+      SELECT ROUND(
+          (julianday('now') - julianday(MIN(created_at))) * 24.0,
+      2) AS sink_lag_h
+      FROM sink_outbox
+      WHERE status IN ('PENDING', 'FAILED')
+    zones:
+      green:  { max: 1.0 }
+      yellow: { min: 1.0, max: 2.0 }
+      red:    { min: 2.0 }
+    null_behavior: green      # empty outbox = green
+
+  # Signal 4: Chunk completion rate
+  # Source: chunk_queue — how many chunks completed in the last hour
+  chunk_completion_rate_h:
+    description: "Chunks reaching COMPLETED status in last 1 hour"
+    unit: count
+    query: |
+      SELECT COUNT(*) AS chunk_completion_rate_h
+      FROM chunk_queue
+      WHERE status = 'COMPLETED'
+        AND completed_at >= datetime('now', '-1 hour')
+    zones:
+      green:  { min: 1 }      # at least one chunk per hour
+      red:    { max: 0 }      # zero = no progress
+    null_behavior: green      # no data = just started = green
+
+# ─── Adjustment Rules ─────────────────────────────────────────────────────────
+
+rules:
+
+  - id: R1
+    name: ImmediateErrorRateReduction
+    trigger: "chunk_error_rate_h.zone == 'red'"
+    action: step_down
+    factor: 0.75
+    cooldown_evals: 2         # wait 10min before next change
+    description: "Error rate > 15% — resolver saturated — reduce parallelism"
+
+  - id: R2
+    name: IngestLagReduction
+    trigger: "ingest_lag_s.zone == 'red'"
+    action: step_down
+    factor: 0.75
+    cooldown_evals: 2
+    description: "Persistence gateway > 5min behind scan — reduce scan rate"
+
+  - id: R3
+    name: SinkBacklogCap
+    trigger: "sink_lag_h.zone == 'red'"
+    action: hold              # hold current PARALLEL — do not increase
+    description: "Sink backlog > 2h — do not increase scan rate"
+
+  - id: R4
+    name: NoProgressHardReduction
+    trigger: "chunk_completion_rate_h.zone == 'red' AND consecutive_red_evals >= 2"
+    action: step_down
+    factor: 0.50
+    cooldown_evals: 3         # wait 15min before next change
+    description: "No chunks completing for 10min — aggressive reduction"
+
+  - id: R5
+    name: NoProgressEmergency
+    trigger: "chunk_completion_rate_h.zone == 'red' AND consecutive_red_evals >= 6"
+    action: set_min
+    cooldown_evals: 6
+    description: "No chunks completing for 30min — reduce to PARALLEL_MIN; ALT-01 should fire"
+
+  - id: R6
+    name: GreenStreakIncrease
+    trigger: "ALL signals GREEN AND consecutive_green_evals >= 3"
+    action: step_up
+    factor: 1.20
+    cooldown_evals: 1
+    description: "All signals healthy for 15min — safely increase parallelism"
+
+  - id: R7
+    name: YellowHold
+    trigger: "ANY signal YELLOW AND ALL signals not RED"
+    action: hold
+    description: "Any signal in warning zone — hold current PARALLEL"
+
+# ─── Anti-flap ────────────────────────────────────────────────────────────────
+
+anti_flap:
+  min_evals_between_increases: 1    # at least 5min between consecutive increases
+  min_evals_between_decreases: 0    # decreases can happen immediately (safety first)
+  max_adjustments_per_hour: 8       # cap total adjustments per hour to prevent oscillation
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+output:
+  controller_log: logs/adaptive_controller.log
+  parallel_history_log: logs/parallel_history.csv   # timestamp, parallel, reason, signals
+  parallel_setting_file: state/parallel_setting.txt  # read by run_full_dns_pass.sh
