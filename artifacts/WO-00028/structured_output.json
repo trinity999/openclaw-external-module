@@ -1,0 +1,147 @@
+{
+  "work_order": "WO-00028",
+  "category": "implementation",
+  "priority": "critical",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-05T00:00:00Z",
+  "source_commit": "trinity999/Pandavs-Framework@cebd2d5",
+  "confidence": 0.95,
+
+  "key_findings": [
+    "event_id SHA-256 (tool|kind|asset|value|port|source_file|line_no) is already the correct ClickHouse deduplication key — maps directly to SQLite PRIMARY KEY",
+    "ReplacingMergeTree(ingested_at) ORDER BY (event_id) provides idempotent replay without per-row existence checks, reducing sink worker complexity significantly",
+    "BEGIN IMMEDIATE claim pattern from WO-00022 must be reused for sink_outbox batch claiming — prevents double-delivery under concurrent workers",
+    "CLAIMED transient status is required for crash recovery — stale CLAIMED rows must be reaped back to PENDING on worker startup (same pattern as reclaim_stale_leases in WO-00022)",
+    "ClickHouse does not raise uniqueness errors on ReplacingMergeTree duplicate inserts — ALREADY_SYNCED classification from WO-00023 taxonomy is not needed for CH; all inserts succeed immediately",
+    "clickhouse-driver native protocol (port 9000) is 3-5x faster than HTTP for bulk inserts; matches the DATABASE_OPS.md host/port (127.0.0.1:9000)",
+    "LowCardinality(String) for tool and event_kind fields yields ~10x compression on 4-value fields; important for 10M+ row scale",
+    "raw_json column must be capped at 1MB per row to avoid hitting ClickHouse max_query_size limits on bulk inserts"
+  ],
+
+  "decisions": [
+    {
+      "id": "DD-1",
+      "decision": "ReplacingMergeTree(ingested_at) for scan_events table",
+      "rationale": "Canonical ClickHouse idempotency pattern; deduplicates by event_id on background merge; no per-row checks needed; FINAL modifier resolves at query time"
+    },
+    {
+      "id": "DD-2",
+      "decision": "ORDER BY (event_id) = PRIMARY KEY (event_id)",
+      "rationale": "event_id SHA-256 is globally unique; enables O(log N) point lookups and deduplication; matches SQLite PK for natural join"
+    },
+    {
+      "id": "DD-3",
+      "decision": "BEGIN IMMEDIATE for batch claim",
+      "rationale": "SQLite WAL serializes concurrent writes; IMMEDIATE acquires reserved lock at transaction start; prevents double-claim across workers"
+    },
+    {
+      "id": "DD-4",
+      "decision": "CLAIMED transient status for in-flight rows",
+      "rationale": "Tracks which rows a specific worker has claimed; enables targeted reaping on crash without touching PENDING/FAILED rows from other workers"
+    },
+    {
+      "id": "DD-5",
+      "decision": "Native protocol (clickhouse-driver) over HTTP",
+      "rationale": "Native protocol bulk insert throughput 3-5x HTTP; supports streaming blocks; matches DATABASE_OPS.md port 9000 configuration"
+    },
+    {
+      "id": "DD-6",
+      "decision": "Batch size 500, interval 60s",
+      "rationale": "500 × 60s = 30k events/min throughput; ClickHouse handles 500-row blocks efficiently; leaves CPU headroom for concurrent scan loop"
+    }
+  ],
+
+  "schema": {
+    "clickhouse_table": "pandavs_recon.scan_events",
+    "engine": "ReplacingMergeTree(ingested_at)",
+    "order_by": ["event_id"],
+    "partition_by": "toYYYYMM(ts)",
+    "dedup_key": "event_id",
+    "integrity_query": "SELECT count() FROM pandavs_recon.scan_events FINAL"
+  },
+
+  "worker": {
+    "file": "clickhouse_sink_worker.py",
+    "entry_points": ["run-once", "loop", "status"],
+    "batch_size_default": 500,
+    "interval_s_default": 60,
+    "claim_timeout_s": 600,
+    "max_retries": 5,
+    "backoff_base_s": 300,
+    "backoff_max_s": 14400,
+    "claim_status": "CLAIMED",
+    "ch_host": "127.0.0.1",
+    "ch_port": 9000,
+    "ch_database": "pandavs_recon"
+  },
+
+  "retry_policy": {
+    "retryable_patterns": ["NETWORK_ERROR", "TIMEOUT", "SERVER_OVERLOADED", "MEMORY_LIMIT_EXCEEDED", "ConnectionRefusedError"],
+    "non_retryable_patterns": ["BAD_ARGUMENTS", "UNKNOWN_TABLE", "TYPE_MISMATCH", "AUTHORIZATION_FAILED"],
+    "backoff_schedule_s": [300, 600, 1200, 2400, 4800],
+    "dlq_trigger": "retry_count >= max_retries OR NON_RETRYABLE"
+  },
+
+  "success_metrics": {
+    "sink_write_success_rate_target_pct": 99.0,
+    "replay_duplicate_rate_target_pct": 0.1,
+    "sink_lag_slo_h": 2.0,
+    "batch_throughput_target_events_per_min": 50000,
+    "worker_crash_recovery_s": 600
+  },
+
+  "risk_model": [
+    {
+      "id": "R1",
+      "risk": "ClickHouse config directory wipe (known DATABASE_OPS.md failure pattern)",
+      "severity": "HIGH",
+      "mitigation": "Worker detects health check failure before claiming batch; rows remain PENDING until CH recovers; runbook: apt-get install --reinstall clickhouse-server"
+    },
+    {
+      "id": "R2",
+      "risk": "ReplacingMergeTree dedup is asynchronous — temporary duplicates between merges",
+      "severity": "MEDIUM",
+      "mitigation": "Use SELECT ... FINAL for all integrity-check queries; documented in WO-00024 monitoring spec MON-03"
+    },
+    {
+      "id": "R3",
+      "risk": "raw_json field may contain arbitrarily large JSON blobs",
+      "severity": "MEDIUM",
+      "mitigation": "Cap at 1MB per row pre-insert; log warning when truncation occurs"
+    },
+    {
+      "id": "R4",
+      "risk": "Backfill of 4.6M existing rows may saturate ClickHouse during initial catch-up",
+      "severity": "MEDIUM",
+      "mitigation": "Rate-limit backfill: batch-size 500, interval 2s; interleaves with scan data; completes in ~3h at 250k/min"
+    },
+    {
+      "id": "R5",
+      "risk": "CLAIMED rows not reaped if reaper interval is too long after crash",
+      "severity": "LOW",
+      "mitigation": "Reaper runs at every worker startup and every 10 sweeps; CLAIM_TIMEOUT_S=600 (10min)"
+    }
+  ],
+
+  "recommended_actions": [
+    "Create pandavs_recon.scan_events table with ReplacingMergeTree DDL before deploying worker",
+    "Deploy clickhouse_sink_worker.py with run-once for initial backfill of 4.6M existing outbox rows",
+    "Then switch to loop mode (--interval 60) for continuous sync",
+    "Run SELECT count() FROM pandavs_recon.scan_events FINAL after backfill to verify count matches SQLite events count",
+    "Integrate worker status into WO-00024 hourly report (MON-03 query reads event_sync_ledger)"
+  ],
+
+  "cross_wo_dependencies": {
+    "WO-00022": "BEGIN IMMEDIATE claim pattern reused from chunk_queue design",
+    "WO-00023": "sink_outbox, event_sync_ledger, dead_letter_events, sink_outbox_retry_log tables required",
+    "WO-00024": "event_sync_ledger.sink_target='clickhouse' feeds MON-03 hourly report; ALT-04/ALT-05 alert on outbox lag/failure"
+  },
+
+  "metrics": {
+    "new_files": 3,
+    "ch_table_new": 1,
+    "worker_functions": 14,
+    "retry_error_patterns": 15,
+    "ddl_lines": 25
+  }
+}
