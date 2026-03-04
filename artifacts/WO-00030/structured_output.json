@@ -1,0 +1,143 @@
+{
+  "work_order": "WO-00030",
+  "category": "operations",
+  "priority": "high",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-05T00:00:00Z",
+  "source_commit": "trinity999/Pandavs-Framework@cebd2d5",
+  "confidence": 0.95,
+
+  "key_findings": [
+    "Replay debt is safe to accumulate indefinitely in SQLite — INSERT OR IGNORE idempotency in persistence_gateway.py and MERGE idempotency in both sink workers guarantee zero data loss and zero corruption from any replay volume",
+    "The burn-down model identifies ClickHouse's theoretical max drain rate of 360,000 rows/hour (Tier C) — enough to drain 200k events in ~34 minutes with scanner paused",
+    "Neo4j halving time at peak 200k debt is ~8h under normal conditions (not 4h like CH) — this is acceptable given graph write overhead; Neo4j go/no-go gate is therefore tighter (G-2: < 5,000 vs G-1: < 10,000)",
+    "The WO-00026 adaptive controller's sink_lag_h signal already provides first-line throttling — the replay debt throttle tier policy (Tier A/B/C) works as a second layer, adjusting batch_size and sweep_interval independently of PARALLEL",
+    "DLQ rows must NEVER be auto-requeued without root cause diagnosis — NON_RETRYABLE errors (auth failure, schema mismatch) will loop infinitely if re-enqueued without a fix",
+    "Go/no-go gate G-6 (burn_rate_positive) is the most critical gate for new module activation — if sync_rate_h <= ingest_rate_h, enabling a new scan module guarantees unbounded debt growth"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "4-tier throttle policy (A/B/C/D) rather than continuous rate limiting",
+      "rationale": "Discrete tiers are operator-interpretable and easily implemented as env-var overrides to batch_size and sweep_interval; continuous rate limiting requires a separate controller process"
+    },
+    {
+      "id": "D2",
+      "decision": "Debt halving time target: 4h for CH, 8h for Neo4j",
+      "rationale": "CH ReplacingMergeTree absorbs inserts unconditionally at 60k rows/h; Neo4j graph MERGE is 3x heavier — setting 8h target for Neo4j is realistic without requiring infrastructure changes"
+    },
+    {
+      "id": "D3",
+      "decision": "6 go/no-go gates (G-1 to G-6) with explicit thresholds before new scan module activation",
+      "rationale": "Enabling a new scan module increases ingest_rate_h; without gates, a strained system could reach ∞ halving time (debt grows faster than drained); gates ensure headroom before adding load"
+    },
+    {
+      "id": "D4",
+      "decision": "DLQ re-enqueue is a manual operation (SQL UPDATE) not an automatic mechanism",
+      "rationale": "Automatic re-enqueue of DEAD rows after a timeout would create retry storms for NON_RETRYABLE errors; operator must confirm root cause is fixed before re-enqueue"
+    },
+    {
+      "id": "D5",
+      "decision": "Hourly monitoring cadence with 5 key metrics per sink",
+      "rationale": "300s refresh matches WO-00026 controller cadence; hourly model is sufficient for operational visibility; sub-minute monitoring not needed for a batch sync worker"
+    }
+  ],
+
+  "burn_down_model": {
+    "formula": "debt(t+1h) = debt(t) - sync_rate_h + ingest_rate_h",
+    "halving_formula": "halving_time_h = active_debt / (sync_rate_h - ingest_rate_h)",
+    "halving_target_ch_h": 4,
+    "halving_target_neo4j_h": 8,
+    "tier_c_ch_drain_200k_minutes": 34,
+    "tier_c_neo4j_drain_200k_minutes": 83
+  },
+
+  "throttle_tiers": {
+    "A_normal": {"batch_size_ch": 500, "batch_size_neo4j": 200, "sweep_s": 30},
+    "B_elevated": {"batch_size_ch": 200, "batch_size_neo4j": 100, "sweep_s": 60},
+    "C_bulk": {"batch_size_ch": 1000, "batch_size_neo4j": 400, "sweep_s": 10},
+    "D_dlq": {"batch_size_ch": 0, "batch_size_neo4j": 0, "sweep_s": 0, "note": "manual intervention"}
+  },
+
+  "go_no_go_gates": [
+    {"id": "G-1", "condition": "ch_active_debt < 10000", "blocks": "httpx ClickHouse writes"},
+    {"id": "G-2", "condition": "neo4j_active_debt < 5000", "blocks": "naabu Port node writes"},
+    {"id": "G-3", "condition": "ch_dead_debt == 0", "blocks": "any CH schema change"},
+    {"id": "G-4", "condition": "neo4j_dead_debt == 0", "blocks": "any new Neo4j node type"},
+    {"id": "G-5", "condition": "dlq_rate_24h_pct < 0.5", "blocks": "any new event kind in sink_outbox"},
+    {"id": "G-6", "condition": "sync_rate_h > ingest_rate_h (both sinks)", "blocks": "any new scan module"}
+  ],
+
+  "success_metrics": {
+    "halving_time_ch_target_h": 4,
+    "halving_time_neo4j_target_h": 8,
+    "data_loss_target": 0,
+    "scan_throughput_degradation_max_pct": 20,
+    "dlq_rate_max_pct": 0.5,
+    "escalation_thresholds": {
+      "yellow_active_debt": 50000,
+      "red_active_debt": 200000,
+      "emergency_dead_debt": 500,
+      "critical_growing_hours": 2
+    }
+  },
+
+  "data_safety_guarantees": [
+    "INSERT OR IGNORE in persistence_gateway.py: events stored exactly once in SQLite regardless of replay count",
+    "ReplacingMergeTree in ClickHouse: duplicate inserts accepted, server-side dedup on merge",
+    "MERGE patterns in Neo4j: idempotent at 10M+ node scale, safe for unlimited replay",
+    "CLAIMED reaper (600s TTL): crashed worker rows return to PENDING, never lost"
+  ],
+
+  "risk_model": [
+    {
+      "id": "R1",
+      "risk": "DLQ auto-requeue re-creates retry storm for NON_RETRYABLE errors",
+      "severity": "HIGH",
+      "mitigation": "Re-enqueue is exclusively manual SQL UPDATE; playbook explicitly requires root cause diagnosis before re-enqueue"
+    },
+    {
+      "id": "R2",
+      "risk": "Tier C bulk burn-down creates SQLite write contention with live scanner",
+      "severity": "MEDIUM",
+      "mitigation": "Tier C is only applied when scanner is paused; WAL mode + BEGIN IMMEDIATE serializes writers safely"
+    },
+    {
+      "id": "R3",
+      "risk": "G-6 not checked before new module activation — debt grows unboundedly",
+      "severity": "HIGH",
+      "mitigation": "Go/no-go checklist in playbook STEP 5 must be completed before any module activation; G-6 is the first gate evaluated"
+    },
+    {
+      "id": "R4",
+      "risk": "halving_time = ∞ not detected until after 2+ hours of growth",
+      "severity": "MEDIUM",
+      "mitigation": "Hourly monitoring query (STEP 4) explicitly computes halving time and flags ∞; escalation threshold triggers at 2 consecutive hours"
+    }
+  ],
+
+  "cross_wo_dependencies": {
+    "WO-00022": "chunk_queue backlog drain; scanner PARALLEL setting",
+    "WO-00023": "sink_outbox, event_sync_ledger, dead_letter_events schema; retry taxonomy",
+    "WO-00025": "FM-08 (CH outage) + FM-15 (Neo4j outage) drills validate playbook STEP 1-2",
+    "WO-00026": "Adaptive controller provides first-line throttle via sink_lag_h; Tier B/C augments this",
+    "WO-00028": "CH sink worker batch_size and sweep_interval settings referenced in throttle tiers",
+    "WO-00029": "Neo4j sink worker batch_size and sweep_interval settings referenced in throttle tiers"
+  },
+
+  "artifacts": [
+    "report.md",
+    "replay_debt_playbook.md",
+    "debt_dashboard_metrics.json",
+    "structured_output.json"
+  ],
+
+  "metrics": {
+    "dashboard_metrics": 15,
+    "go_no_go_gates": 6,
+    "throttle_tiers": 4,
+    "escalation_thresholds": 5,
+    "playbook_steps": 5
+  }
+}

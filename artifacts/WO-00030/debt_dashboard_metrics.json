@@ -1,0 +1,316 @@
+{
+  "dashboard": "Replay Debt Dashboard — Pandavs Recon Framework",
+  "work_order": "WO-00030",
+  "version": "1.0.0",
+  "refresh_interval_s": 300,
+  "data_source": "scan_persistence.db",
+  "produced_at": "2026-03-05T00:00:00Z",
+
+  "metrics": [
+    {
+      "id": "M-01",
+      "name": "ch_active_debt",
+      "label": "ClickHouse Active Debt",
+      "description": "PENDING + FAILED (retry-eligible) rows in sink_outbox for ClickHouse",
+      "unit": "events",
+      "query": "SELECT COUNT(*) FROM sink_outbox WHERE sink_target='clickhouse' AND status IN ('PENDING','FAILED') AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)",
+      "thresholds": {
+        "green": {"max": 10000},
+        "yellow": {"min": 10000, "max": 50000},
+        "red": {"min": 50000, "max": 200000},
+        "critical": {"min": 200000}
+      },
+      "go_no_go_gate": "G-1"
+    },
+    {
+      "id": "M-02",
+      "name": "neo4j_active_debt",
+      "label": "Neo4j Active Debt",
+      "description": "PENDING + FAILED (retry-eligible) rows in sink_outbox for Neo4j",
+      "unit": "events",
+      "query": "SELECT COUNT(*) FROM sink_outbox WHERE sink_target='neo4j' AND status IN ('PENDING','FAILED') AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)",
+      "thresholds": {
+        "green": {"max": 5000},
+        "yellow": {"min": 5000, "max": 50000},
+        "red": {"min": 50000, "max": 200000},
+        "critical": {"min": 200000}
+      },
+      "go_no_go_gate": "G-2"
+    },
+    {
+      "id": "M-03",
+      "name": "ch_dead_debt",
+      "label": "ClickHouse Dead Debt (DLQ)",
+      "description": "Rows in DLQ (status=DEAD) for ClickHouse — require manual intervention",
+      "unit": "events",
+      "query": "SELECT COUNT(*) FROM sink_outbox WHERE sink_target='clickhouse' AND status='DEAD'",
+      "thresholds": {
+        "green": {"max": 0},
+        "yellow": {"min": 1, "max": 10},
+        "red": {"min": 10, "max": 100},
+        "critical": {"min": 100}
+      },
+      "go_no_go_gate": "G-3"
+    },
+    {
+      "id": "M-04",
+      "name": "neo4j_dead_debt",
+      "label": "Neo4j Dead Debt (DLQ)",
+      "description": "Rows in DLQ (status=DEAD) for Neo4j — require manual intervention",
+      "unit": "events",
+      "query": "SELECT COUNT(*) FROM sink_outbox WHERE sink_target='neo4j' AND status='DEAD'",
+      "thresholds": {
+        "green": {"max": 0},
+        "yellow": {"min": 1, "max": 10},
+        "red": {"min": 10, "max": 100},
+        "critical": {"min": 100}
+      },
+      "go_no_go_gate": "G-4"
+    },
+    {
+      "id": "M-05",
+      "name": "ch_deferred_debt",
+      "label": "ClickHouse Deferred Debt",
+      "description": "FAILED rows in backoff window (next_retry_at in future) — temporarily ineligible",
+      "unit": "events",
+      "query": "SELECT COUNT(*) FROM sink_outbox WHERE sink_target='clickhouse' AND status='FAILED' AND next_retry_at > CURRENT_TIMESTAMP",
+      "thresholds": {
+        "green": {"max": 1000},
+        "yellow": {"min": 1000, "max": 10000},
+        "red": {"min": 10000}
+      }
+    },
+    {
+      "id": "M-06",
+      "name": "neo4j_deferred_debt",
+      "label": "Neo4j Deferred Debt",
+      "description": "FAILED rows in backoff window for Neo4j",
+      "unit": "events",
+      "query": "SELECT COUNT(*) FROM sink_outbox WHERE sink_target='neo4j' AND status='FAILED' AND next_retry_at > CURRENT_TIMESTAMP",
+      "thresholds": {
+        "green": {"max": 500},
+        "yellow": {"min": 500, "max": 5000},
+        "red": {"min": 5000}
+      }
+    },
+    {
+      "id": "M-07",
+      "name": "ch_sync_rate_h",
+      "label": "ClickHouse Sync Rate (last hour)",
+      "description": "Events successfully written to ClickHouse in the past hour",
+      "unit": "events/hour",
+      "query": "SELECT COUNT(*) FROM event_sync_ledger WHERE sink_target='clickhouse' AND synced_at >= datetime('now','-1 hour') AND outcome='SYNCED'",
+      "thresholds": {
+        "green": {"min": 5000},
+        "yellow": {"min": 1000, "max": 5000},
+        "red": {"max": 1000}
+      }
+    },
+    {
+      "id": "M-08",
+      "name": "neo4j_sync_rate_h",
+      "label": "Neo4j Sync Rate (last hour)",
+      "description": "Events successfully written to Neo4j in the past hour",
+      "unit": "events/hour",
+      "query": "SELECT COUNT(*) FROM event_sync_ledger WHERE sink_target='neo4j' AND synced_at >= datetime('now','-1 hour') AND outcome='SYNCED'",
+      "thresholds": {
+        "green": {"min": 2000},
+        "yellow": {"min": 500, "max": 2000},
+        "red": {"max": 500}
+      }
+    },
+    {
+      "id": "M-09",
+      "name": "ingest_rate_h",
+      "label": "SQLite Ingest Rate (last hour)",
+      "description": "New events written to events table from scanner in the past hour",
+      "unit": "events/hour",
+      "query": "SELECT COUNT(*) FROM events WHERE ts >= datetime('now','-1 hour')"
+    },
+    {
+      "id": "M-10",
+      "name": "ch_halving_time_h",
+      "label": "ClickHouse Debt Halving Time",
+      "description": "Estimated hours to halve CH active debt at current net burn rate. Formula: active_debt / (sync_rate_h - ingest_rate_h). NULL if sync_rate <= ingest_rate (debt growing).",
+      "unit": "hours",
+      "query": "computed",
+      "formula": "ch_active_debt / MAX(0.0001, (ch_sync_rate_h - ingest_rate_h))",
+      "thresholds": {
+        "green": {"max": 4},
+        "yellow": {"min": 4, "max": 8},
+        "red": {"min": 8},
+        "critical_label": "∞ (sync_rate <= ingest_rate — debt growing)"
+      },
+      "halving_target_h": 4
+    },
+    {
+      "id": "M-11",
+      "name": "neo4j_halving_time_h",
+      "label": "Neo4j Debt Halving Time",
+      "description": "Estimated hours to halve Neo4j active debt at current net burn rate.",
+      "unit": "hours",
+      "query": "computed",
+      "formula": "neo4j_active_debt / MAX(0.0001, (neo4j_sync_rate_h - ingest_rate_h))",
+      "thresholds": {
+        "green": {"max": 8},
+        "yellow": {"min": 8, "max": 12},
+        "red": {"min": 12}
+      },
+      "halving_target_h": 8
+    },
+    {
+      "id": "M-12",
+      "name": "dlq_rate_24h_pct",
+      "label": "DLQ Promotion Rate (last 24h)",
+      "description": "Percentage of sync attempts that ended in DLQ promotion vs total SYNCED",
+      "unit": "percent",
+      "query": "computed",
+      "formula": "100.0 * dead_promoted_24h / MAX(1, synced_24h)",
+      "component_queries": {
+        "dead_promoted_24h": "SELECT COUNT(*) FROM dead_letter_events WHERE promoted_at >= datetime('now','-24 hour')",
+        "synced_24h": "SELECT COUNT(*) FROM event_sync_ledger WHERE synced_at >= datetime('now','-24 hour') AND outcome='SYNCED'"
+      },
+      "thresholds": {
+        "green": {"max": 0.5},
+        "yellow": {"min": 0.5, "max": 2.0},
+        "red": {"min": 2.0}
+      },
+      "go_no_go_gate": "G-5"
+    },
+    {
+      "id": "M-13",
+      "name": "burn_rate_positive",
+      "label": "Net Burn Rate Positive",
+      "description": "Boolean: is sync_rate_h > ingest_rate_h for both sinks? (debt shrinking)",
+      "unit": "boolean",
+      "query": "computed",
+      "formula": "(ch_sync_rate_h > ingest_rate_h) AND (neo4j_sync_rate_h > ingest_rate_h)",
+      "go_no_go_gate": "G-6"
+    },
+    {
+      "id": "M-14",
+      "name": "ch_claimed_count",
+      "label": "ClickHouse In-Flight (CLAIMED)",
+      "description": "Rows currently claimed by an active CH worker. Non-zero = worker is running.",
+      "unit": "events",
+      "query": "SELECT COUNT(*) FROM sink_outbox WHERE sink_target='clickhouse' AND status='CLAIMED'"
+    },
+    {
+      "id": "M-15",
+      "name": "neo4j_claimed_count",
+      "label": "Neo4j In-Flight (CLAIMED)",
+      "description": "Rows currently claimed by an active Neo4j worker. Non-zero = worker is running.",
+      "unit": "events",
+      "query": "SELECT COUNT(*) FROM sink_outbox WHERE sink_target='neo4j' AND status='CLAIMED'"
+    }
+  ],
+
+  "go_no_go_gates": [
+    {
+      "id": "G-1",
+      "name": "CH debt safe for httpx",
+      "condition": "ch_active_debt < 10000",
+      "blocks": "ClickHouse httpx event writes",
+      "metric_ref": "M-01"
+    },
+    {
+      "id": "G-2",
+      "name": "Neo4j debt safe for naabu",
+      "condition": "neo4j_active_debt < 5000",
+      "blocks": "Neo4j naabu Port node writes",
+      "metric_ref": "M-02"
+    },
+    {
+      "id": "G-3",
+      "name": "CH DLQ clear",
+      "condition": "ch_dead_debt == 0",
+      "blocks": "Any new ClickHouse schema change",
+      "metric_ref": "M-03"
+    },
+    {
+      "id": "G-4",
+      "name": "Neo4j DLQ clear",
+      "condition": "neo4j_dead_debt == 0",
+      "blocks": "Any new Neo4j node type introduction",
+      "metric_ref": "M-04"
+    },
+    {
+      "id": "G-5",
+      "name": "DLQ rate acceptable",
+      "condition": "dlq_rate_24h_pct < 0.5",
+      "blocks": "Any new event kind in sink_outbox",
+      "metric_ref": "M-12"
+    },
+    {
+      "id": "G-6",
+      "name": "Burn rate positive",
+      "condition": "ch_sync_rate_h > ingest_rate_h AND neo4j_sync_rate_h > ingest_rate_h",
+      "blocks": "Any new scan module activation (increases ingest_rate)",
+      "metric_ref": "M-13"
+    }
+  ],
+
+  "throttle_tiers": [
+    {
+      "tier": "A",
+      "name": "Normal operation",
+      "trigger": "active_debt < 50000",
+      "ch_batch_size": 500,
+      "neo4j_batch_size": 200,
+      "sweep_interval_s": 30,
+      "expected_ch_rate_h": 60000,
+      "expected_neo4j_rate_h": 24000
+    },
+    {
+      "tier": "B",
+      "name": "Elevated debt — scanner running",
+      "trigger": "active_debt 50k-200k AND scanner_running",
+      "ch_batch_size": 200,
+      "neo4j_batch_size": 100,
+      "sweep_interval_s": 60,
+      "expected_ch_rate_h": 12000,
+      "expected_neo4j_rate_h": 6000,
+      "note": "Protects ingest_lag_s from RED zone per WO-00026 controller"
+    },
+    {
+      "tier": "C",
+      "name": "Bulk burn-down — scanner paused",
+      "trigger": "scanner_paused OR off_hours",
+      "ch_batch_size": 1000,
+      "neo4j_batch_size": 400,
+      "sweep_interval_s": 10,
+      "expected_ch_rate_h": 360000,
+      "expected_neo4j_rate_h": 144000,
+      "expected_drain_time_200k_ch_min": 34,
+      "expected_drain_time_200k_neo4j_min": 83
+    },
+    {
+      "tier": "D",
+      "name": "DLQ intervention",
+      "trigger": "dead_debt > 0",
+      "ch_batch_size": 0,
+      "neo4j_batch_size": 0,
+      "sweep_interval_s": 0,
+      "note": "Stop all replays, diagnose root cause, re-enqueue after fix"
+    }
+  ],
+
+  "escalation_thresholds": [
+    {"level": "YELLOW",    "trigger": "active_debt > 50000",          "action": "Switch to Tier B throttle, alert operator"},
+    {"level": "RED",       "trigger": "active_debt > 200000",         "action": "Switch to Tier C if possible, alert"},
+    {"level": "CRITICAL",  "trigger": "debt_growing_for_hours >= 2",  "action": "Pause scanner, run Tier C drain"},
+    {"level": "EMERGENCY", "trigger": "dead_debt > 500",              "action": "Stop all sink workers, diagnose DLQ"},
+    {"level": "HALVING_MISS", "trigger": "halving_time_h > 8",        "action": "Evaluate: pause scanner or scale workers"}
+  ],
+
+  "burn_down_model": {
+    "formula": "debt(t+1h) = debt(t) - sync_rate_h + ingest_rate_h",
+    "halving_formula": "halving_time_h = debt(t) / (sync_rate_h - ingest_rate_h)",
+    "halving_target_ch_h": 4,
+    "halving_target_neo4j_h": 8,
+    "required_ch_sync_rate_at_200k_peak": 55000,
+    "required_neo4j_sync_rate_at_200k_peak": 30000,
+    "scan_paused_ch_drain_200k_min": 34,
+    "scan_paused_neo4j_drain_200k_min": 83
+  }
+}
