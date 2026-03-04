@@ -1,0 +1,215 @@
+{
+  "work_order": "WO-00024",
+  "category": "observability",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "source_commit": "trinity999/Pandavs-Framework@cebd2d5",
+  "confidence": 0.96,
+
+  "key_findings": [
+    "All required metric data is available in scan_persistence.db after WO-00022 and WO-00023 migrations — zero new schema changes required for WO-00024",
+    "run_full_dns_pass.sh emits CHUNK_START/CHUNK_DONE log events (lines 17, 28) but these are text-only; chunk_queue.completed_at (WO-00022) is the canonical queryable progress store",
+    "ingest_runs table (persistence_gateway.py lines 91-101) already tracks per-run error counts — feeds ALT-02 persistence error alert without additional instrumentation",
+    "Hourly report fields from PHASE_IMPLEMENTATION_PLAN.md lines 152-160 map 1:1 to chunk_queue + event_sync_ledger + sink_outbox queries — no ambiguity in source attribution",
+    "ETA is computed over rolling 1-hour completion rate window (not cumulative average) for responsiveness to actual pipeline speed changes",
+    "ALT-01 (NoChunkProgress) uses 5-minute eval sweep despite 30-minute threshold — tight polling catches the stall early and avoids alerting exactly at the 30-minute boundary",
+    "ALT-03 (DeadLetterAccumulation) fires immediately on dlq_unreviewed >= 1 — DLQ entries are discrete incidents, not rate thresholds, and require immediate human attention",
+    "MEDIUM alerts require 2 consecutive positive evaluations before firing — reduces false alert rate below 5% target for transient metric spikes"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "SQLite as sole metric source (not log files)",
+      "rationale": "Log files are append-only text requiring parsing; SQLite provides structured, timestamped, transactionally-consistent data queryable without parsing logic; chunk_queue.completed_at is authoritative"
+    },
+    {
+      "id": "D2",
+      "decision": "Hourly report is a cumulative snapshot (monotonic counters)",
+      "rationale": "Monotonically non-decreasing counters are simpler to validate — they can only increase; downstream consumers compute deltas; prevents negative rate bugs from double-counting"
+    },
+    {
+      "id": "D3",
+      "decision": "ETA computed over rolling 1-hour window",
+      "rationale": "Most recent 1-hour rate is more responsive than cumulative average; reflects actual pipeline speed at time of reporting; NULL when rate_per_h = 0 rather than infinity"
+    },
+    {
+      "id": "D4",
+      "decision": "Alert evaluator runs every 5 minutes (not hourly)",
+      "rationale": "ALT-01 threshold is 30 minutes — hourly evaluation would have up to 60-minute detection latency; 5-minute sweep guarantees ≤35 minute detection latency for no-progress condition"
+    },
+    {
+      "id": "D5",
+      "decision": "min_consecutive_fires=2 for MEDIUM alerts",
+      "rationale": "Single transient metric spike should not wake an operator; two consecutive cycles above threshold (10 minutes apart) confirms a real trend; exception for DLQ (immediate always)"
+    },
+    {
+      "id": "D6",
+      "decision": "Suppression rules for post-completion state",
+      "rationale": "When all 51 chunks complete, ALT-01 and ALT-06 would permanently fire (no further progress expected); suppression rules prevent false alerts after successful pipeline completion"
+    }
+  ],
+
+  "monitoring_queries": {
+    "count": 11,
+    "ids": ["MON-01", "MON-02", "MON-03", "MON-04", "MON-05", "MON-06", "MON-07", "MON-08", "MON-09", "MON-10", "MON-11"],
+    "composite_query": "MON-11",
+    "composite_description": "Single-pass hourly status matrix — runs all counters in one SQLite session for consistency"
+  },
+
+  "alert_rules": [
+    {
+      "id": "ALT-01",
+      "name": "NoChunkProgress",
+      "severity": "HIGH",
+      "threshold": "seconds_since_last_chunk > 1800",
+      "min_consecutive_fires": 1,
+      "eval_interval_s": 300,
+      "detection_field": "seconds_since_last_chunk",
+      "detection_query_ref": "MON-09",
+      "source": "PHASE_IMPLEMENTATION_PLAN.md Phase 4: 'no chunk progress >30 min'"
+    },
+    {
+      "id": "ALT-02",
+      "name": "PersistenceErrors",
+      "severity": "MEDIUM",
+      "threshold": "ingest_errors_last_h > 10",
+      "min_consecutive_fires": 2,
+      "eval_interval_s": 300,
+      "detection_field": "ingest_errors_last_h",
+      "detection_query_ref": "MON-06",
+      "source": "PHASE_IMPLEMENTATION_PLAN.md Phase 4: 'persistence errors > threshold'"
+    },
+    {
+      "id": "ALT-03",
+      "name": "DeadLetterAccumulation",
+      "severity": "MEDIUM",
+      "threshold": "dlq_unreviewed >= 1",
+      "min_consecutive_fires": 1,
+      "eval_interval_s": 300,
+      "detection_field": "dlq_unreviewed",
+      "detection_query_ref": "MON-10",
+      "source": "WO-00023 DLQ design: any unreviewed DLQ entry requires human review"
+    },
+    {
+      "id": "ALT-04",
+      "name": "SinkBacklogAge",
+      "severity": "HIGH",
+      "threshold": "sink_lag_h > 2.0",
+      "min_consecutive_fires": 1,
+      "eval_interval_s": 300,
+      "detection_field": "sink_lag_h",
+      "detection_query_ref": "MON-05",
+      "source": "WO-00023 success metric: sink backlog oldest age <2h (steady state)"
+    },
+    {
+      "id": "ALT-05",
+      "name": "SyncFailurePattern",
+      "severity": "MEDIUM",
+      "threshold": "failed_count > 50 (any sink_target)",
+      "min_consecutive_fires": 2,
+      "eval_interval_s": 300,
+      "detection_field": "failed_count",
+      "detection_query_ref": "MON-04",
+      "source": "PHASE_IMPLEMENTATION_PLAN.md Phase 4: 'DB sync failures repeated >N'"
+    },
+    {
+      "id": "ALT-06",
+      "name": "CoverageStalled",
+      "severity": "MEDIUM",
+      "threshold": "coverage_pct unchanged for 2 consecutive hourly reports",
+      "min_consecutive_fires": 2,
+      "eval_interval_s": 3600,
+      "detection_field": "chunks.coverage_pct",
+      "detection_query_ref": "compare_consecutive_reports",
+      "source": "WO-00024 success metric: hourly report continuity 100%"
+    },
+    {
+      "id": "ALT-07",
+      "name": "ReportMissing",
+      "severity": "MEDIUM",
+      "threshold": "hourly report file not present after 5 min past hour boundary",
+      "min_consecutive_fires": 1,
+      "eval_interval_s": 300,
+      "detection_field": "report_file_exists",
+      "detection_query_ref": "filesystem_check",
+      "source": "WO-00024 success metric: hourly report continuity 100%"
+    }
+  ],
+
+  "hourly_report_schema": {
+    "file": "hourly_report_schema.json",
+    "schema_version": "1.0",
+    "top_level_fields": ["schema_version", "report_ts", "report_window_start_ts", "run_id", "chunks", "persistence", "sink", "alerts_active", "blockers", "source_queries"],
+    "chunks_fields": ["completed", "total", "coverage_pct", "pending", "leased", "failed", "dead_letter", "last_chunk_completed_ts", "rate_per_h", "eta_h"],
+    "persistence_fields": ["events_total", "ingest_errors_last_h", "files_registered"],
+    "sink_fields": ["clickhouse_synced", "neo4j_synced", "outbox_pending", "outbox_failed", "outbox_dead_letter", "sink_lag_h", "dlq_unreviewed"],
+    "additionalProperties": false,
+    "report_filename_pattern": "reports/hourly_<YYYYMMDDTHH>.json"
+  },
+
+  "success_metrics": {
+    "hourly_report_continuity_pct_target": 100.0,
+    "false_alert_rate_pct_target": 5.0,
+    "no_progress_detection_latency_max_min": 30,
+    "sink_lag_slo_h": 2.0,
+    "evaluation_interval_s": 300,
+    "report_emission_cron": "0 * * * *"
+  },
+
+  "implementation_sequence": [
+    {"priority": 1, "action": "Deploy WO-00022 schema_patch.sql + WO-00023 sqlite_schema_migration.sql if not already applied"},
+    {"priority": 2, "action": "Create reports/ directory and generate_hourly_report.sh that runs MON-11 and writes hourly_<YYYYMMDDTHH>.json"},
+    {"priority": 3, "action": "Add cron: `0 * * * * /path/to/generate_hourly_report.sh` for 100% report continuity"},
+    {"priority": 4, "action": "Implement alert_evaluator.py consuming alert_policy.yaml — runs every 5 minutes, evaluates all ALT-01..07 conditions"},
+    {"priority": 5, "action": "Add cron: `*/5 * * * * python3 alert_evaluator.py` for continuous alert sweep"},
+    {"priority": 6, "action": "Run continuity drill: verify 2+ consecutive reports emitted with monotonically increasing coverage_pct"},
+    {"priority": 7, "action": "Run no-progress drill: pause chunk processing, verify ALT-01 fires within 35 minutes"},
+    {"priority": 8, "action": "Run DLQ drill: manually insert dead_letter_events row, verify ALT-03 fires on next eval cycle"}
+  ],
+
+  "cross_wo_dependencies": {
+    "WO-00022": "chunk_queue table and completed_at timestamps required for ALT-01, MON-01, MON-07, MON-08, MON-09",
+    "WO-00023": "sink_outbox, event_sync_ledger, dead_letter_events required for ALT-03, ALT-04, ALT-05, MON-03, MON-04, MON-05, MON-10"
+  },
+
+  "risk_model": [
+    {
+      "id": "R1",
+      "risk": "Alert evaluator process crashes silently — alerts not evaluated",
+      "severity": "HIGH",
+      "mitigation": "Run evaluator under supervisord or systemd with auto-restart; ALT-07 (ReportMissing) catches report generator failures; add evaluator heartbeat to logs"
+    },
+    {
+      "id": "R2",
+      "risk": "CoverageStalled (ALT-06) fires as false alert when pipeline completes",
+      "severity": "LOW",
+      "mitigation": "Suppression rule: suppress ALT-06 when chunks.completed == 51; evaluator checks suppression rules before firing"
+    },
+    {
+      "id": "R3",
+      "risk": "ETA computation returns NULL when no chunks complete in last 1h",
+      "severity": "LOW",
+      "mitigation": "By design: NULL eta_h is correct when rate_per_h=0; report consumers display 'ETA: unknown (pipeline stalled)' and ALT-01 will fire concurrently"
+    },
+    {
+      "id": "R4",
+      "risk": "MON-11 composite query takes too long on 10M+ event table",
+      "severity": "MEDIUM",
+      "mitigation": "All metrics use COUNT(*) on indexed columns (event_sync_ledger.sink_target indexed, sink_outbox.status indexed); SQLite COUNT is O(table_scan) but fast on warm cache; measure query time and add covering index if >2s"
+    }
+  ],
+
+  "metrics": {
+    "new_monitoring_queries": 11,
+    "new_alert_rules": 7,
+    "schema_changes_required": 0,
+    "new_schema_files": 1,
+    "alert_policy_version": "1.0",
+    "eval_interval_s": 300,
+    "report_emit_interval_s": 3600,
+    "target_false_alert_rate_pct": 5.0,
+    "target_detection_latency_min": 30,
+    "target_report_continuity_pct": 100.0
+  }
+}

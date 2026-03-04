@@ -1,0 +1,255 @@
+# Pandavs Pipeline Alert Policy
+# Work Order: WO-00024 | Category: observability | Priority: HIGH
+# Source commit: trinity999/Pandavs-Framework@cebd2d5
+# Schema version: 1.0
+#
+# Usage:
+#   This file is consumed by alert_evaluator.py (to be implemented).
+#   Evaluator reads the latest hourly_report.json + runs detection queries
+#   against scan_persistence.db every `eval_interval_s` seconds.
+#   Alert fires if `condition` evaluates true for `min_consecutive_fires`
+#   consecutive evaluation cycles (or immediately if that value is 1).
+#
+# Severity definitions:
+#   HIGH   → operator response required within 15 minutes; possible data loss or pipeline halt
+#   MEDIUM → investigation required within 2 hours; degraded operation or growing backlog
+#
+# False-alert suppression:
+#   HIGH alerts:   min_consecutive_fires: 1 (immediate)
+#   MEDIUM alerts: min_consecutive_fires: 2 (two consecutive eval cycles)
+#   Exception:     ALT-03 (DLQ) always immediate regardless of MEDIUM severity
+
+meta:
+  policy_version: "1.0"
+  pipeline: pandavs-day1
+  db: scan_persistence.db
+  eval_interval_s: 300          # 5-minute evaluation sweep
+  report_emit_cron: "0 * * * *" # hourly report at :00 of each hour
+  alert_log_path: "logs/alert_log.json"
+  target_false_alert_rate_pct: 5.0
+
+# ─── Alert Rules ─────────────────────────────────────────────────────────────
+
+alerts:
+
+  # ALT-01: No chunk progress for 30+ minutes
+  # Fires when the pipeline has gone 1800s without completing any chunk.
+  # Indicates: stuck worker, deadlocked queue, or crashed scan loop.
+  # Source: PHASE_IMPLEMENTATION_PLAN.md Phase 4 alert rule: "no chunk progress >30 min"
+  - id: ALT-01
+    name: NoChunkProgress
+    severity: HIGH
+    min_consecutive_fires: 1
+    eval_interval_s: 300        # override: check every 5 min (threshold is 30 min)
+    detection_query: |
+      SELECT
+          ROUND(
+              (julianday('now') - julianday(MAX(completed_at))) * 86400.0
+          ) AS seconds_since_last_chunk
+      FROM chunk_queue
+      WHERE status = 'COMPLETED';
+    # Fires if: seconds_since_last_chunk > 1800 OR result IS NULL (no chunks completed yet and pipeline ran > 30min)
+    condition:
+      field: seconds_since_last_chunk
+      operator: ">"
+      threshold: 1800
+      null_behavior: "fire_if_pipeline_running_gt_1800s"
+      # Pipeline running check: SELECT 1 FROM chunk_queue LIMIT 1 (non-empty = seeded)
+    message_template: "No chunk completed in {seconds_since_last_chunk}s (last: {last_chunk_ts}). Pipeline stalled. Check worker heartbeats and chunk_queue LEASED rows."
+    runbook:
+      - "Run: SELECT * FROM chunk_queue WHERE status='LEASED' — check last_heartbeat_at; if stale >7200s, run reclaim_stale_leases()"
+      - "Check if run_full_dns_pass.sh or queue_controller.py processes are alive"
+      - "Inspect logs/full_dns_pass_*.log for last CHUNK_DONE timestamp"
+      - "If no workers running: restart with `python3 queue_controller.py run --workers 3`"
+
+  # ALT-02: Persistence ingest errors above threshold
+  # Fires when ingest_runs.errors sum exceeds 10 in any 1-hour window.
+  # Indicates: malformed result files, SQLite write failures, or schema mismatch.
+  # Source: PHASE_IMPLEMENTATION_PLAN.md Phase 4: "persistence errors > threshold"
+  - id: ALT-02
+    name: PersistenceErrors
+    severity: MEDIUM
+    min_consecutive_fires: 2
+    detection_query: |
+      SELECT COALESCE(SUM(errors), 0) AS ingest_errors_last_h
+      FROM ingest_runs
+      WHERE started_ts >= datetime('now', '-1 hour');
+    condition:
+      field: ingest_errors_last_h
+      operator: ">"
+      threshold: 10
+    message_template: "{ingest_errors_last_h} ingest errors in last 1h (threshold: 10). Check persistence_gateway.py logs and malformed result files."
+    runbook:
+      - "Query: SELECT run_id, errors, note FROM ingest_runs WHERE started_ts >= datetime('now','-1 hour') AND errors > 0"
+      - "Inspect the note field for error context"
+      - "Check files table: SELECT * FROM files WHERE status='error' LIMIT 20"
+      - "Verify scan result file format matches parser expectations in persistence_gateway.py"
+      - "If SQLite: check disk space and WAL file size"
+
+  # ALT-03: Dead letter events accumulating (unreviewed)
+  # Fires immediately when ANY unreviewed DLQ entry exists.
+  # Indicates: events permanently failed to reach ClickHouse or Neo4j after max_retries.
+  # Source: WO-00023 design — DLQ entries always require human review.
+  - id: ALT-03
+    name: DeadLetterAccumulation
+    severity: MEDIUM              # MEDIUM by class, but min_consecutive_fires=1 (immediate)
+    min_consecutive_fires: 1      # Exception: DLQ always immediate
+    detection_query: |
+      SELECT COUNT(*) AS dlq_unreviewed
+      FROM dead_letter_events
+      WHERE reviewed_at IS NULL;
+    condition:
+      field: dlq_unreviewed
+      operator: ">="
+      threshold: 1
+    message_template: "{dlq_unreviewed} unreviewed dead letter event(s) in dead_letter_events. Manual review required before replay."
+    runbook:
+      - "Query: SELECT dlq_id, event_id, sink_target, final_error_class, final_error_message, total_attempts FROM dead_letter_events WHERE reviewed_at IS NULL"
+      - "Classify error: RETRYABLE (transient) or NON_RETRYABLE (schema/auth/format)"
+      - "If RETRYABLE root cause fixed: UPDATE dead_letter_events SET replay_requested=1, reviewed_at=datetime('now'), reviewed_by='operator' WHERE dlq_id=<id>"
+      - "Then update sink_outbox: UPDATE sink_outbox SET status='PENDING', retry_count=0, next_retry_at=datetime('now') WHERE event_id=<event_id> AND sink_target=<target>"
+      - "If NON_RETRYABLE: document in reviewed_by field, set replay_requested=0"
+
+  # ALT-04: Sink backlog too old (sink lag SLO breach)
+  # Fires when oldest PENDING/FAILED outbox entry is > 2 hours old.
+  # SLO: sink_lag_h < 2.0h. Source: WO-00023 success metrics.
+  - id: ALT-04
+    name: SinkBacklogAge
+    severity: HIGH
+    min_consecutive_fires: 1
+    detection_query: |
+      SELECT
+          ROUND(
+              (julianday('now') - julianday(MIN(created_at))) * 24.0,
+              2
+          ) AS sink_lag_h
+      FROM sink_outbox
+      WHERE status IN ('PENDING', 'FAILED');
+    condition:
+      field: sink_lag_h
+      operator: ">"
+      threshold: 2.0
+      null_behavior: "no_fire"   # NULL = outbox is empty = healthy
+    message_template: "Sink outbox oldest entry is {sink_lag_h}h old (SLO: <2h). ClickHouse or Neo4j may be unreachable."
+    runbook:
+      - "Check ClickHouse: clickhouse-client --host 127.0.0.1 --port 9000 --user default --password pandavs_ch_2026 --query 'SELECT 1'"
+      - "Check Neo4j: cypher-shell -a bolt://localhost:7687 'RETURN 1' (container: pandavs-neo4j-fixed)"
+      - "Query stale outbox: SELECT sink_target, COUNT(*), MIN(created_at) FROM sink_outbox WHERE status IN ('PENDING','FAILED') GROUP BY sink_target"
+      - "If sink is healthy: check outbox_sweep_worker.py process is running"
+      - "Emergency: if sink will be down >4h, add blockers entry to next hourly report"
+
+  # ALT-05: Sync failure pattern — many FAILED outbox rows
+  # Fires when > 50 sink_outbox rows are in FAILED state (active retry queue growing).
+  # Indicates: systematic sink connectivity issue causing retry accumulation.
+  # Source: PHASE_IMPLEMENTATION_PLAN.md Phase 4: "DB sync failures repeated >N"
+  - id: ALT-05
+    name: SyncFailurePattern
+    severity: MEDIUM
+    min_consecutive_fires: 2
+    detection_query: |
+      SELECT
+          sink_target,
+          COUNT(*) AS failed_count,
+          MAX(last_error_message) AS sample_error
+      FROM sink_outbox
+      WHERE status = 'FAILED'
+      GROUP BY sink_target;
+    condition:
+      # Fires if ANY sink_target has failed_count > 50
+      aggregation: "any_row"
+      field: failed_count
+      operator: ">"
+      threshold: 50
+    message_template: "Sink outbox FAILED count > 50 for one or more targets. Possible systematic sink error. Sample: {sample_error}."
+    runbook:
+      - "Query: SELECT sink_target, last_error_class, COUNT(*) FROM sink_outbox WHERE status='FAILED' GROUP BY sink_target, last_error_class"
+      - "Check retry_taxonomy.json — if errors map to NON_RETRYABLE, they will escalate to DLQ after max_retries"
+      - "If RETRYABLE (transient): wait for outbox_sweep_worker.py to clear on sink recovery"
+      - "If failure rate not decreasing after 1h: investigate sink health (see ALT-04 runbook)"
+      - "Check next_retry_at distribution: SELECT MIN(next_retry_at), MAX(next_retry_at) FROM sink_outbox WHERE status='FAILED'"
+
+  # ALT-06: Coverage stalled (same coverage_pct in 2 consecutive hourly reports)
+  # Fires when coverage_pct has not increased between two consecutive hourly reports.
+  # Indicates: no new chunks completing (all workers idle or no PENDING chunks but not COMPLETED).
+  # Complementary to ALT-01 (which fires faster, within 30 min).
+  - id: ALT-06
+    name: CoverageStalled
+    severity: MEDIUM
+    min_consecutive_fires: 2
+    detection_method: "compare_consecutive_reports"  # not a DB query — reads last 2 report files
+    detection_logic: |
+      # Pseudo-code for evaluator:
+      # report_now = load reports/hourly_<current_hour>.json
+      # report_prev = load reports/hourly_<prev_hour>.json
+      # if report_now.chunks.coverage_pct == report_prev.chunks.coverage_pct:
+      #     return True  (stalled)
+      # else:
+      #     return False
+    condition:
+      field: "chunks.coverage_pct"
+      operator: "=="
+      compare_to: "previous_report"
+    message_template: "Coverage stuck at {coverage_pct}% for 2 consecutive hourly reports. No new chunks completing."
+    runbook:
+      - "Check ALT-01 status — if ALT-01 already fired, follow that runbook first"
+      - "Query: SELECT status, COUNT(*) FROM chunk_queue GROUP BY status — are all remaining chunks LEASED (workers active but slow)?"
+      - "Check lease expiry: SELECT * FROM chunk_queue WHERE status='LEASED' ORDER BY lease_expires_at ASC LIMIT 5"
+      - "If all 51 chunks COMPLETED but coverage_pct shows 100%: this is a false alert; verify and mark resolved"
+
+# ─── Report Missing Alert ────────────────────────────────────────────────────
+
+  # ALT-07: Report continuity — hourly report not emitted on schedule
+  # Special class: detected by the evaluator process, not a DB query.
+  # Fires if no report file exists for the expected hour window.
+  # Source: WO-00024 success metric: hourly report continuity 100%.
+  - id: ALT-07
+    name: ReportMissing
+    severity: MEDIUM
+    min_consecutive_fires: 1
+    detection_method: "filesystem_check"
+    detection_logic: |
+      # Pseudo-code:
+      # expected_file = f"reports/hourly_{datetime.utcnow().strftime('%Y%m%dT%H')}.json"
+      # if not os.path.exists(expected_file) and minutes_past_hour > 5:
+      #     return True
+    message_template: "Hourly report not emitted for window {expected_hour}. Report generator may have crashed."
+    runbook:
+      - "Check if generate_hourly_report.sh cron job ran: journalctl -u cron | grep hourly_report"
+      - "Re-run manually: bash generate_hourly_report.sh"
+      - "Check SQLite availability: sqlite3 scan_persistence.db 'SELECT 1'"
+      - "Check disk space: df -h (reports/ directory full?)"
+
+# ─── Alert Suppression Rules ─────────────────────────────────────────────────
+
+suppression:
+  # If all 51 chunks are COMPLETED, suppress ALT-01 and ALT-06
+  # (pipeline is done — no further progress is expected or required)
+  - condition: "chunks.completed == 51"
+    suppress_alerts: ["ALT-01", "ALT-06"]
+    reason: "Pipeline complete — no further chunk progress expected"
+
+  # If outbox is fully clear, suppress ALT-04 and ALT-05
+  - condition: "sink.outbox_pending == 0 AND sink.outbox_failed == 0"
+    suppress_alerts: ["ALT-04", "ALT-05"]
+    reason: "No outbox backlog — sink lag and failure alerts are spurious"
+
+# ─── Alert Output Format ─────────────────────────────────────────────────────
+
+output:
+  format: json
+  destination: logs/alert_log.json
+  # Each alert fire appends one JSON object:
+  # {
+  #   "fired_at": "<ISO8601>",
+  #   "alert_id": "ALT-01",
+  #   "alert_name": "NoChunkProgress",
+  #   "severity": "HIGH",
+  #   "message": "<rendered message_template>",
+  #   "metric_values": { "<field>": <value>, ... },
+  #   "consecutive_fires": 1,
+  #   "resolved_at": null
+  # }
+  notification_channels:
+    # Extend this section to wire into Slack, PagerDuty, email, etc.
+    - type: log        # always write to alert_log.json
+    - type: stderr     # also print to stderr for cron job visibility

@@ -257,6 +257,51 @@
       "artifact_gates": "artifacts/WO-00021/milestone_gates.json",
       "confidence": 0.94,
       "depends_on": ["WO-00019", "WO-00020"]
+    },
+    {
+      "id": "WO-00022",
+      "category": "implementation",
+      "priority": "critical",
+      "state": "completed",
+      "created_at": "2026-03-04T00:00:00Z",
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-04T00:00:00Z",
+      "artifact_report": "artifacts/WO-00022/report.md",
+      "artifact_structured": "artifacts/WO-00022/structured_output.json",
+      "artifact_schema": "artifacts/WO-00022/schema_patch.sql",
+      "artifact_state_machine": "artifacts/WO-00022/worker_state_machine.md",
+      "confidence": 0.95,
+      "depends_on": []
+    },
+    {
+      "id": "WO-00023",
+      "category": "data-engineering",
+      "priority": "high",
+      "state": "completed",
+      "created_at": "2026-03-04T00:00:00Z",
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-04T00:00:00Z",
+      "artifact_report": "artifacts/WO-00023/report.md",
+      "artifact_structured": "artifacts/WO-00023/structured_output.json",
+      "artifact_migration": "artifacts/WO-00023/sqlite_schema_migration.sql",
+      "artifact_taxonomy": "artifacts/WO-00023/retry_taxonomy.json",
+      "confidence": 0.93,
+      "depends_on": []
+    },
+    {
+      "id": "WO-00024",
+      "category": "observability",
+      "priority": "high",
+      "state": "completed",
+      "created_at": "2026-03-04T00:00:00Z",
+      "enrichment": "WOEP_v1_applied",
+      "completed_at": "2026-03-04T00:00:00Z",
+      "artifact_report": "artifacts/WO-00024/report.md",
+      "artifact_structured": "artifacts/WO-00024/structured_output.json",
+      "artifact_schema": "artifacts/WO-00024/hourly_report_schema.json",
+      "artifact_alert_policy": "artifacts/WO-00024/alert_policy.yaml",
+      "confidence": 0.96,
+      "depends_on": ["WO-00022", "WO-00023"]
     }
   ]
 }
