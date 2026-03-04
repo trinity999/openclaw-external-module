@@ -1,0 +1,145 @@
+{
+  "work_order": "WO-00022",
+  "category": "implementation",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-04T00:00:00Z",
+  "source_commit": "trinity999/Pandavs-Framework@cebd2d5",
+  "confidence": 0.95,
+
+  "key_findings": [
+    "run_full_dns_pass.sh uses stateless while-read loop over dnsx_queue.txt — no crash recovery, no concurrency guard, no deduplication across restarts",
+    "persistence_gateway.py already establishes SQLite WAL at scan_persistence.db — chunk_queue table is additive, zero-risk schema extension",
+    "event_hash() in persistence_gateway.py is SHA-256 of tool|kind|asset|value|port|source_file|line_no — chunk output filename timestamps create new files on retry but persistence deduplicates by event_id",
+    "BEGIN IMMEDIATE serializes lease grants in SQLite — multiple concurrent Python workers cannot double-claim a chunk, even without external locking",
+    "Heartbeat interval 60s << lease_ttl 7200s provides wide safety margin: reaper only triggers after full 2h expiry, preventing false reclaims on slow-but-alive workers",
+    "Audit log table (chunk_queue_audit_log) is append-only — provides complete forensic trail of every state transition for post-mortem analysis",
+    "Retry backoff is exponential: 300s base, doubles each retry — prevents retry storms on systematic failures while still recovering from transient errors within 3 attempts"
+  ],
+
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "SQLite as queue backend (same file as persistence_gateway)",
+      "rationale": "Already present, WAL-enabled, no new infrastructure; IMMEDIATE isolation provides correct concurrent lease semantics"
+    },
+    {
+      "id": "D2",
+      "decision": "Python wrapper replaces bash while-read loop",
+      "rationale": "Python already present; gains subprocess control, timeout, structured error capture, heartbeat threading — bash+sqlite3 CLI is fragile"
+    },
+    {
+      "id": "D3",
+      "decision": "Lease TTL = 7200s (2h), heartbeat interval = 60s",
+      "rationale": "Chunks may take 30-90min; 2h gives margin. 60s heartbeat is low overhead. Reaper detects dead workers within one lease_ttl period."
+    },
+    {
+      "id": "D4",
+      "decision": "Max retries = 3, exponential backoff base 300s",
+      "rationale": "3 attempts sufficient for transient failures; exponential backoff prevents storm; FAILED_PERMANENT requires human review after 3rd failure"
+    },
+    {
+      "id": "D5",
+      "decision": "chunk_id = SHA-256[:16] of chunk_file_path",
+      "rationale": "Stable across restarts; deterministic from input; collision probability negligible at 51 chunks"
+    },
+    {
+      "id": "D6",
+      "decision": "Reaper runs inline on grant_lease() + optional cron",
+      "rationale": "Piggyback minimizes required processes; cron provides safety net for idle periods"
+    }
+  ],
+
+  "schema": {
+    "new_tables": ["chunk_queue", "chunk_queue_audit_log"],
+    "modified_tables": [],
+    "new_indexes": [
+      "idx_cq_status_priority",
+      "idx_cq_lease_expires",
+      "idx_cq_retry_ready",
+      "idx_cq_worker",
+      "idx_cqal_chunk_id",
+      "idx_cqal_event_type"
+    ],
+    "new_triggers": ["trg_cq_updated_at"],
+    "migration_type": "additive",
+    "safe_to_run_on_existing_db": true
+  },
+
+  "functions": [
+    {"name": "populate_chunk_queue", "purpose": "Seed 51 chunks into DB from dnsx_queue.txt; idempotent via INSERT OR IGNORE"},
+    {"name": "grant_lease", "purpose": "Atomically claim next PENDING chunk via BEGIN IMMEDIATE; returns ChunkLease or None"},
+    {"name": "heartbeat", "purpose": "Update last_heartbeat_at for active lease; returns False if lease reclaimed"},
+    {"name": "start_heartbeat_thread", "purpose": "Background thread calling heartbeat() every 60s; returns stop Event"},
+    {"name": "ack_chunk", "purpose": "Transactionally mark chunk COMPLETED or FAILED/FAILED_PERMANENT with stats"},
+    {"name": "reclaim_stale_leases", "purpose": "Reaper: return expired leases to PENDING or FAILED_PERMANENT"}
+  ],
+
+  "state_machine": {
+    "states": ["PENDING", "LEASED", "COMPLETED", "FAILED", "FAILED_PERMANENT"],
+    "transitions": [
+      {"from": null, "to": "PENDING", "trigger": "populate_chunk_queue"},
+      {"from": "PENDING", "to": "LEASED", "trigger": "grant_lease (BEGIN IMMEDIATE)"},
+      {"from": "LEASED", "to": "COMPLETED", "trigger": "ack_chunk(success=True)"},
+      {"from": "LEASED", "to": "FAILED", "trigger": "ack_chunk(success=False, retry_count < max)"},
+      {"from": "LEASED", "to": "FAILED_PERMANENT", "trigger": "ack_chunk(success=False, retry_count >= max)"},
+      {"from": "LEASED", "to": "PENDING", "trigger": "reclaim_stale_leases (lease_expires_at < now, retry < max)"},
+      {"from": "LEASED", "to": "FAILED_PERMANENT", "trigger": "reclaim_stale_leases (lease_expires_at < now, retry >= max)"},
+      {"from": "FAILED", "to": "PENDING", "trigger": "reclaim_stale_leases (next_retry_at <= now)"}
+    ]
+  },
+
+  "risk_model": [
+    {
+      "id": "R1",
+      "risk": "SQLite write contention under many concurrent workers",
+      "severity": "MEDIUM",
+      "probability": "LOW",
+      "mitigation": "WAL handles concurrent reads; BEGIN IMMEDIATE serializes lease grants in <1ms; 3-6 workers is safe ceiling for 51 chunks"
+    },
+    {
+      "id": "R2",
+      "risk": "Reaper reclaims active worker mid-execution",
+      "severity": "HIGH",
+      "probability": "LOW",
+      "mitigation": "Heartbeat 60s << lease_ttl 7200s; only triggers after full expiry; heartbeat() returns False to signal worker should abort"
+    },
+    {
+      "id": "R3",
+      "risk": "Chunk output filename collision on retry (same chunk, new timestamp)",
+      "severity": "LOW",
+      "probability": "MEDIUM",
+      "mitigation": "New timestamp suffix produces new filename; persistence_gateway deduplicates by event_id SHA-256 — no DB duplicates"
+    },
+    {
+      "id": "R4",
+      "risk": "Schema migration fails on running DB",
+      "severity": "HIGH",
+      "probability": "LOW",
+      "mitigation": "CREATE TABLE IF NOT EXISTS is idempotent; no ALTER TABLE on existing tables; safe to run while persistence_gateway is active"
+    }
+  ],
+
+  "recommended_actions": [
+    {"priority": 1, "action": "Run schema_patch.sql on scan_persistence.db to create chunk_queue + audit_log tables"},
+    {"priority": 2, "action": "Run `python3 queue_controller.py seed` once to populate 51 chunks from dnsx_queue.txt"},
+    {"priority": 3, "action": "Replace run_full_dns_pass.sh while-loop with `python3 queue_controller.py run --workers 3`"},
+    {"priority": 4, "action": "Add reaper cron: `*/2 * * * * python3 queue_controller.py reap`"},
+    {"priority": 5, "action": "Verify with status query: `python3 queue_controller.py status` shows 51 total, 0 LEASED by ghosts"},
+    {"priority": 6, "action": "Run crash drill: kill worker mid-chunk, verify reclaim within lease_ttl, verify no duplicate output"}
+  ],
+
+  "metrics": {
+    "chunks_total": 51,
+    "target_workers_concurrent": 3,
+    "lease_ttl_s": 7200,
+    "heartbeat_interval_s": 60,
+    "max_retries": 3,
+    "retry_backoff_base_s": 300,
+    "retry_backoff_type": "exponential_doubling",
+    "stuck_chunk_recovery_max_min": 120,
+    "duplicate_chunk_execution_target": 0,
+    "new_db_tables": 2,
+    "new_db_indexes": 6,
+    "new_functions": 6
+  }
+}
