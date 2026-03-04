@@ -1,0 +1,201 @@
+{
+  "work_order": "WO-00029",
+  "category": "implementation",
+  "priority": "high",
+  "analyst": "openclaw-field-processor",
+  "produced_at": "2026-03-05T00:00:00Z",
+  "source_commit": "trinity999/Pandavs-Framework@cebd2d5",
+  "confidence": 0.94,
+
+  "key_findings": [
+    "Phase-1 minimal subset (dns_resolution only) is safe to deploy against 10M+ existing Neo4j nodes — MERGE never raises uniqueness conflicts and is fully idempotent across reruns",
+    "ID generation must mirror neo4j_manager.py exactly: sub_+uuid5(NAMESPACE_DNS, subdomain.lower()), ip_+uuid5(NAMESPACE_URL, ip), dom_+uuid5(NAMESPACE_DNS, domain.lower()) — mismatch would create orphaned duplicate nodes",
+    "dnsx persistence_gateway.py joins multiple IPs with commas; the sync worker must split on comma and execute one MERGE-5 per IP — treating the joined string as a single IP creates garbage ip_id values that cannot be deduplicated",
+    "neo4j_manager.py must NOT be imported — validators dependency causes import failure in this environment (DATABASE_OPS.md Issue-2); ID generation and MERGE logic reproduced inline using only the neo4j driver",
+    "MERGE-5 composite pattern (all four MERGE operations in one transaction) is preferred over 4 sequential round-trips — minimizes Bolt connection overhead and ensures atomicity per (subdomain, IP) pair",
+    "ConstraintValidationFailed must be classified as ALREADY_SYNCED (not FAILED) — node already written correctly, retrying would always fail and inflate retry_count unnecessarily"
+  ],
+
+  "decisions": [
+    {
+      "id": "DD-1",
+      "decision": "batch_size=200 (not 500 as in ClickHouse worker)",
+      "rationale": "Neo4j graph writes have higher per-operation overhead than CH INSERT; smaller batches keep Bolt session alive and transaction scopes tight"
+    },
+    {
+      "id": "DD-2",
+      "decision": "MERGE-5 composite (single transaction per event)",
+      "rationale": "One Bolt round-trip per (subdomain, IP) pair; 4 separate round-trips would be 4x slower; atomic: no partial write possible"
+    },
+    {
+      "id": "DD-3",
+      "decision": "Split comma-joined IPs from event.value before MERGE",
+      "rationale": "persistence_gateway.py dnsx parser: value = ','.join(ips[:5]); must split or generate garbage ip_id from concatenated string"
+    },
+    {
+      "id": "DD-4",
+      "decision": "ConstraintValidationFailed → ALREADY_SYNCED (mark SYNCED)",
+      "rationale": "Node already exists with same key — this is a successful idempotent write, not a failure; marking FAILED would cause infinite retry loop"
+    },
+    {
+      "id": "DD-5",
+      "decision": "Use neo4j driver directly, not neo4j_manager.py",
+      "rationale": "validators import failure documented in DATABASE_OPS.md Issue-2; ID generation reproduced inline using identical uuid5 logic"
+    },
+    {
+      "id": "DD-6",
+      "decision": "Root domain extraction mirrors neo4j_manager.py multi-part TLD logic",
+      "rationale": "Generated domain_id must match existing Domain nodes; different extraction logic would create duplicate Domain nodes with different IDs"
+    },
+    {
+      "id": "DD-7",
+      "decision": "CLAIMED reaper at 600s (identical to CH worker)",
+      "rationale": "Prevents stranded batches after worker crash; safe because MERGE is idempotent; consistent with WO-00028 recovery model"
+    }
+  ],
+
+  "schema": {
+    "phase_1_nodes": [
+      {
+        "label": "Subdomain",
+        "key_property": "subdomain_id",
+        "id_formula": "sub_ + uuid5(NAMESPACE_DNS, subdomain.lower())",
+        "properties": ["subdomain", "resolution_status", "first_seen", "last_updated", "last_found_date", "status"]
+      },
+      {
+        "label": "IP",
+        "key_property": "ip_id",
+        "id_formula": "ip_ + uuid5(NAMESPACE_URL, ip_address)",
+        "properties": ["ip_address", "ip_type", "first_seen", "last_updated", "status"]
+      },
+      {
+        "label": "Domain",
+        "key_property": "domain_id",
+        "id_formula": "dom_ + uuid5(NAMESPACE_DNS, root_domain.lower())",
+        "properties": ["domain", "created_at", "is_root_domain", "status"]
+      }
+    ],
+    "phase_1_relationships": [
+      {
+        "type": "RESOLVES_TO",
+        "from": "Subdomain",
+        "to": "IP",
+        "properties": ["record_type", "first_seen", "last_seen"]
+      },
+      {
+        "type": "BELONGS_TO",
+        "from": "Subdomain",
+        "to": "Domain",
+        "properties": ["created_at"]
+      }
+    ],
+    "phase_2_preview": [
+      {
+        "node_label": "Port",
+        "relationship_type": "HAS_PORT",
+        "from": "IP",
+        "trigger_event_kind": "naabu_port_scan"
+      }
+    ]
+  },
+
+  "worker": {
+    "entry_point": "neo4j_sync_worker.py",
+    "subcommands": ["run-once", "loop", "status"],
+    "batch_size": 200,
+    "loop_interval_s": 30,
+    "claimed_ttl_s": 600,
+    "sink_target": "neo4j",
+    "phase_1_event_kind": "dns_resolution",
+    "neo4j_uri": "bolt://localhost:7687",
+    "neo4j_database": "reconnaissance",
+    "cypher_pattern": "MERGE-5 composite (single transaction per (subdomain, IP) pair)",
+    "driver_package": "neo4j",
+    "excluded_package": "validators (import failure — DATABASE_OPS.md Issue-2)"
+  },
+
+  "retry_policy": {
+    "max_retries": 5,
+    "base_backoff_s": 300,
+    "max_backoff_s": 14400,
+    "backoff_formula": "min(300 * 2^retry_count, 14400)",
+    "schedule_s": [300, 600, 1200, 2400, 4800],
+    "error_classes": {
+      "ALREADY_SYNCED": "ConstraintValidationFailed — node exists; mark SYNCED immediately",
+      "NON_RETRYABLE": "AuthError, CypherSyntaxError, InvalidArgument — promote to DLQ immediately",
+      "RETRYABLE": "ServiceUnavailable, TransientError, UNKNOWN — retry with backoff up to MAX_RETRIES",
+      "UNKNOWN": "unrecognized exception — treated as RETRYABLE (conservative)"
+    }
+  },
+
+  "success_metrics": {
+    "duplicate_relationship_rate_target": 0,
+    "worker_recovery_after_restart_min": 15,
+    "idempotency_validation": "count(RESOLVES_TO) identical before and after second sync run",
+    "orphaned_subdomains_target": 0,
+    "mttr_target_s": 900
+  },
+
+  "integrity_queries": {
+    "resolves_to_count": "MATCH ()-[r:RESOLVES_TO]->() RETURN count(r) AS resolves_to_count",
+    "subdomain_count": "MATCH (s:Subdomain) RETURN count(s) AS subdomain_count",
+    "orphaned_subdomains": "MATCH (s:Subdomain) WHERE NOT (s)-[:BELONGS_TO]->() RETURN count(s) AS orphaned_subdomains",
+    "idempotency_before": "MATCH (s:Subdomain)-[r:RESOLVES_TO]->(i:IP) RETURN count(r) AS before_second_run",
+    "idempotency_after": "MATCH (s:Subdomain)-[r:RESOLVES_TO]->(i:IP) RETURN count(r) AS after_second_run"
+  },
+
+  "risk_model": [
+    {
+      "id": "R1",
+      "risk": "ID mismatch with existing neo4j_manager.py nodes if uuid5 namespace or case handling differs",
+      "severity": "HIGH",
+      "mitigation": "ID generation code explicitly mirrors neo4j_manager.py lines 337-348; multi-part TLD logic mirrored from _extract_root_domain_from_subdomain"
+    },
+    {
+      "id": "R2",
+      "risk": "Comma-joined IP not split — creates garbage ip_id like 'ip_{uuid5(\"1.2.3.4,5.6.7.8\")}'",
+      "severity": "HIGH",
+      "mitigation": "map_dns_event_to_params() splits on comma and iterates; verified against persistence_gateway.py parse_event_from_json()"
+    },
+    {
+      "id": "R3",
+      "risk": "validators import failure blocks worker startup if neo4j_manager.py is imported",
+      "severity": "HIGH",
+      "mitigation": "Worker imports only from neo4j driver; neo4j_manager.py is never imported"
+    },
+    {
+      "id": "R4",
+      "risk": "Neo4j container not running — all writes fail with ServiceUnavailable",
+      "severity": "MEDIUM",
+      "mitigation": "ServiceUnavailable is RETRYABLE; rows remain PENDING/FAILED with backoff; recovery via DATABASE_OPS.md §Neo4j Recovery; MTTR < 15 min"
+    },
+    {
+      "id": "R5",
+      "risk": "Phase-2 schema changes (Port nodes) cause MERGE-5 to fail if Phase-1 worker is still running",
+      "severity": "LOW",
+      "mitigation": "Phase-2 patterns are additive property SETs and separate MERGE queries; Phase-1 MERGE-5 pattern is unaffected; restart worker with new version"
+    }
+  ],
+
+  "cross_wo_dependencies": {
+    "WO-00022": "sink_outbox table with sink_target column required for batch claim",
+    "WO-00023": "event_sync_ledger, dead_letter_events, sink_outbox_retry_log required for outcome recording and DLQ promotion",
+    "WO-00025": "FM-15 (Neo4j sink) and FM-16 (Neo4j auth failure) drills validate this worker's recovery paths",
+    "WO-00028": "Shared claim pattern (BEGIN IMMEDIATE), CLAIMED TTL, retry taxonomy, DLQ promotion logic"
+  },
+
+  "artifacts": [
+    "report.md",
+    "cypher_merge_patterns.cypher",
+    "neo4j_sync_minimal_subset.md",
+    "structured_output.json"
+  ],
+
+  "metrics": {
+    "cypher_patterns": 5,
+    "integrity_queries": 5,
+    "phase2_preview_patterns": 2,
+    "design_decisions": 7,
+    "risk_items": 5
+  }
+}
